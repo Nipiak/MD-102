@@ -1,5 +1,5 @@
 ﻿# ============================================================
-# Script : Intune Global Dashboard Generator - v3.2 (UI premium + navigation par pages)
+# Script : Intune Global Dashboard Generator - v3.3 (analyse des non-conformités via l'API Graph)
 # Description : Génère un dashboard HTML interactif pour visualiser 
 #               l'état des appareils Intune (conformité, chiffrement, 
 #               applications, update rings, hardware)
@@ -21,6 +21,21 @@
 #                   menu d'onglets collant, transitions, liens directs
 #                   (#securite...), bouton Précédent, impression de
 #                   toutes les pages - aucune donnée supprimée
+# Nouveautés v3.3 : page "Sécurité & conformité" enrichie par l'analyse des
+#                   postes non conformes (logique reprise du script de
+#                   référence "Non_compliant.ps1") :
+#                   - données interrogées en direct via l'API Graph (rapport
+#                     Intune "Noncompliant devices and settings", repli
+#                     automatique sur l'API par appareil) : plus d'export
+#                     manuel ni de fichier intermédiaire
+#                   - classement par catégorie et par raison, ancienneté de
+#                     synchronisation (0-5 j / 6-29 j / 30 j et +),
+#                     actionnabilité (hors réseau) et tri par urgence
+#                   - KPI, graphiques et synthèses dans le dashboard, export
+#                     CSV (indicateurs, catégories, raisons, postes, détail)
+#                   - appels Graph fiabilisés : nouvelles tentatives sur
+#                     429 / 5xx / erreur réseau (Retry-After, backoff),
+#                     renouvellement du jeton, messages d'erreur explicites
 # Auteur : ECONOCOM
 # ============================================================
 
@@ -37,6 +52,40 @@ $OutputFolder = "C:\temp"
 # considéré comme inactif dans la section "Non Encrypted" du dashboard.
 # Utilisé par le filtre (case à cocher) et le compteur dynamique.
 $NonEncryptedInactiveDays = 30
+
+# ===== [v3.3] ANALYSE DES NON-CONFORMITÉS (PAGE "SÉCURITÉ & CONFORMITÉ") =====
+# Logique reprise du script de référence "Non_compliant.ps1" ; les données ne
+# proviennent plus d'un export manuel mais de l'API Graph.
+# Seuils d'ancienneté de la dernière synchronisation Intune :
+$NcSeuilVert       = 5     # <= 5 jours   -> synchronisation récente, priorité haute
+$NcSeuilOrange     = 29    # 6 à 29 jours -> vigilance
+$NcSeuilRouge      = 30    # >= 30 jours  -> poste fantôme
+$NcSeuilHorsReseau = 15    # > 15 jours + erreur "réseau" -> action impossible
+
+# Mots-clés d'une erreur qui EXIGE que le poste soit joignable (réseau,
+# pare-feu, BitLocker, inactivité). Comparaison sans casse, accents ni
+# ponctuation, sur la raison et le paramètre Intune. Liste librement extensible.
+$NcKeywordsHorsReseau = @(
+    "reseau", "network", "wifi", "vpn", "connexion", "connectivity",
+    "pare feu", "parefeu", "firewall",
+    "bitlocker", "chiffrement", "encryption",
+    "inactif", "contact requis", "is active", "inactivity",
+    "remaincontact", "activefirewall", "firewallrequired",
+    "bitlockerenabled", "isactive"
+)
+
+# Source des données : rapport Intune "Noncompliant devices and settings"
+# (quelques appels paginés pour tout le tenant). $false = analyse appareil par
+# appareil uniquement (un appel par poste non conforme, plus lent).
+$NcUseBulkReport  = $true
+$NcReportPageSize = 500
+
+# Export CSV : séparateur ";" (Excel en français), encodage UTF-8 avec BOM
+$NcCsvDelimiter = ";"
+
+# ===== [v3.3] RÉSILIENCE DES APPELS À L'API GRAPH =====
+$GraphMaxRetries        = 5     # nouvelles tentatives sur 429 / 5xx / erreur réseau
+$GraphRequestTimeoutSec = 120   # délai maximal d'une requête (secondes)
 
 # ===== COORDONNÉES ENTREPRISE PAR DÉFAUT =====
 $DefaultCompanyName   = "ECONOCOM"
@@ -170,6 +219,12 @@ function Show-InfoMessage([string]$message) {
     [System.Windows.Forms.MessageBox]::Show($message, "Information", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information)
 }
 
+# [v3.3] Met à jour la ligne d'état de la fenêtre (sans effet hors interface)
+function Set-UiStatus([string]$Text) {
+    if ($lblStatus) { $lblStatus.Text = $Text }
+    if ($form)      { $form.Refresh() }
+}
+
 # ========================================
 # [UI v3.1] COMPOSANTS VISUELS DU DASHBOARD
 # ========================================
@@ -204,6 +259,14 @@ $IxIcons = @{
     'package'    = '<line x1="16.5" y1="9.4" x2="7.5" y2="4.21"/><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><polyline points="3.27 6.96 12 12.01 20.73 6.96"/><line x1="12" y1="22.08" x2="12" y2="12"/>'
     'gauge'      = '<path d="m12 14 4-4"/><path d="M3.34 19a10 10 0 1 1 17.32 0"/>'
     'printer'    = '<polyline points="6 9 6 2 18 2 18 9"/><path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2"/><rect x="6" y="14" width="12" height="8"/>'
+    # [v3.3] Analyse des non-conformités
+    'file-text'  = '<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/>'
+    'database'   = '<ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/>'
+    'info'       = '<circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/>'
+    'wifi-off'   = '<line x1="1" y1="1" x2="23" y2="23"/><path d="M16.72 11.06A10.94 10.94 0 0 1 19 12.55"/><path d="M5 12.55a10.94 10.94 0 0 1 5.17-2.39"/><path d="M10.71 5.05A16 16 0 0 1 22.58 9"/><path d="M1.42 9a15.91 15.91 0 0 1 4.7-2.88"/><path d="M8.53 16.11a6 6 0 0 1 6.95 0"/><line x1="12" y1="20" x2="12.01" y2="20"/>'
+    'list'       = '<line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/>'
+    'zap'        = '<polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/>'
+    'tool'       = '<path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/>'
 }
 
 # Retourne une icône SVG inline. $Stroke est une chaîne pour éviter la virgule décimale (culture fr-FR).
@@ -245,7 +308,7 @@ function New-IxStatCard {
 
 # État vide (aucune donnée) : message orienté action plutôt qu'un simple texte
 function New-IxEmptyState {
-    param([string]$Icon, [string]$Title, [string]$Text = "", [ValidateSet('success', 'neutral')][string]$Tone = 'neutral')
+    param([string]$Icon, [string]$Title, [string]$Text = "", [ValidateSet('success', 'neutral', 'danger')][string]$Tone = 'neutral')
     $txt = if ($Text) { "<div class=`"ix-empty__text`">$Text</div>" } else { "" }
     return @"
 <div class="ix-root ix-empty ix-empty--$Tone">
@@ -497,8 +560,29 @@ html body input, html body select, html body button, html body label, html body 
 .ix-empty__icon { display: inline-flex; align-items: center; justify-content: center; width: 52px; height: 52px; border-radius: 16px; }
 .ix-empty--success .ix-empty__icon { color: #059669; background: #ecfdf5; }
 .ix-empty--neutral .ix-empty__icon { color: #475569; background: #f1f5f9; }
+.ix-empty--danger .ix-empty__icon { color: #dc2626; background: #fef2f2; }
 .ix-empty__title { font-size: 16px; font-weight: 600; color: var(--ix-ink); }
 .ix-empty__text { max-width: 60ch; font-size: 13px; color: var(--ix-muted); }
+
+/* ---------- [v3.3] Analyse des non-conformités : note de lecture, source, avertissements ---------- */
+.ix-note {
+  display: flex; align-items: flex-start; gap: 12px;
+  margin: 14px 4px 4px; padding: 14px 18px; border-radius: 14px;
+  font-size: 13px; color: #78350f; background: #fffbeb; border: 1px solid #fde68a;
+}
+.ix-note .ix-icon { flex-shrink: 0; margin-top: 1px; color: #d97706; }
+.ix-note strong { font-weight: 600; }
+.ix-note ul { margin: 6px 0 0; padding-left: 18px; }
+.ix-note li + li { margin-top: 4px; }
+.ix-note--warn { color: #7f1d1d; background: #fef2f2; border-color: #fecaca; }
+.ix-note--warn .ix-icon { color: #dc2626; }
+.ix-meta { display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 4px 2px; }
+.ix-meta__item {
+  display: inline-flex; align-items: center; gap: 7px; max-width: 100%; padding: 4px 11px; border-radius: 999px;
+  font-size: 12.5px; font-weight: 500; color: #475569; background: #f1f5f9; border: 1px solid var(--ix-border);
+  overflow-wrap: anywhere;
+}
+.ix-meta__item .ix-icon { color: var(--ix-indigo); }
 
 /* ---------- Tables DataTables ---------- */
 .dataTables_wrapper { font-size: 13px; color: var(--ix-ink-2); }
@@ -912,75 +996,386 @@ function Anonymize-DeviceData {
     }
 }
 
+# ========================================
+# [v3.3] APPELS À L'API GRAPH : GESTION DES ERREURS
+# ========================================
+# Tous les appels REST des sections "Sécurité & conformité" (et les appels paginés
+# des Update Rings) passent par Invoke-GraphApiRequest :
+#  - 429 (throttling), 500/502/503/504 et erreurs réseau : nouvelles tentatives
+#    bornées ($GraphMaxRetries), délai Retry-After sinon backoff exponentiel
+#  - 401 : jeton renouvelé une fois puis requête rejouée
+#  - autres erreurs (400, 403, 404...) : exception au message explicite (code
+#    HTTP, code Graph, request-id, piste de résolution). Le code HTTP est exposé
+#    dans Exception.Data['StatusCode'] pour les appelants.
+# Compatible Windows PowerShell 5.1 et PowerShell 7.
+
+# Contexte d'authentification de la génération en cours (renseigné dans Generate-Dashboard)
+$script:GraphAuth = $null
+
+# Extrait d'une erreur Invoke-RestMethod / Invoke-WebRequest : code HTTP,
+# délai Retry-After, code et message Graph (ou OAuth), request-id, erreur réseau.
+function Get-GraphErrorInfo {
+    param([System.Management.Automation.ErrorRecord]$ErrorRecord)
+
+    $ex   = $ErrorRecord.Exception
+    $info = [pscustomobject]@{ StatusCode = 0; RetryAfter = 0; Code = ""; Message = "$($ex.Message)"; RequestId = ""; IsNetworkError = $false }
+
+    $response = $null
+    if ($ex.PSObject.Properties['Response']) { $response = $ex.Response }
+
+    if ($response) {
+        try { $info.StatusCode = [int]$response.StatusCode } catch { }
+        try {
+            $retryAfter = $null
+            if ($response.Headers -is [System.Net.WebHeaderCollection]) {
+                $retryAfter = $response.Headers['Retry-After']                        # Windows PowerShell 5.1
+            } elseif ($response.Headers -and $response.Headers.RetryAfter) {
+                $rc = $response.Headers.RetryAfter                                     # PowerShell 7
+                if ($rc.Delta)    { $retryAfter = $rc.Delta.TotalSeconds }
+                elseif ($rc.Date) { $retryAfter = ($rc.Date - [DateTimeOffset]::UtcNow).TotalSeconds }
+            }
+            $seconds = 0.0
+            if ($null -ne $retryAfter -and
+                [double]::TryParse("$retryAfter", [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$seconds) -and
+                $seconds -gt 0) {
+                $info.RetryAfter = [int][math]::Ceiling($seconds)
+            }
+        } catch { }
+    } else {
+        # Pas de réponse HTTP : délai dépassé, DNS, proxy, connexion interrompue...
+        $inner = $ex
+        while ($inner) {
+            if ($inner.GetType().FullName -in @('System.Net.WebException', 'System.Net.Http.HttpRequestException',
+                    'System.Threading.Tasks.TaskCanceledException', 'System.TimeoutException',
+                    'System.IO.IOException', 'System.Net.Sockets.SocketException')) {
+                $info.IsNetworkError = $true; break
+            }
+            $inner = $inner.InnerException
+        }
+    }
+
+    # Corps de l'erreur : Graph { error: { code, message, innerError } } ou OAuth { error, error_description }
+    $body = $null
+    if ($ErrorRecord.ErrorDetails -and $ErrorRecord.ErrorDetails.Message) { $body = $ErrorRecord.ErrorDetails.Message }
+    if ($body) {
+        try {
+            $json = $body | ConvertFrom-Json -ErrorAction Stop
+            if ($json.error -is [string]) {
+                $info.Code = $json.error
+                if ($json.error_description) { $info.Message = ("$($json.error_description)" -split "`r?`n")[0] }
+            } elseif ($json.error) {
+                if ($json.error.code)    { $info.Code    = "$($json.error.code)" }
+                if ($json.error.message) { $info.Message = "$($json.error.message)" }
+                $innerError = $json.error.innerError
+                if ($innerError) {
+                    $requestId = $innerError.'request-id'
+                    if (-not $requestId) { $requestId = $innerError.requestId }
+                    if ($requestId) { $info.RequestId = "$requestId" }
+                }
+            }
+        } catch {
+            if ($body.Length -le 300) { $info.Message = $body.Trim() }
+        }
+    }
+    return $info
+}
+
+# Message d'erreur lisible, avec une piste de résolution selon le code HTTP
+function Format-GraphErrorMessage {
+    param([object]$Info, [string]$Method, [string]$Uri, [int]$Attempts)
+
+    $path = $Uri
+    try { $path = ([uri]$Uri).AbsolutePath } catch { }
+    $status = if ($Info.StatusCode -gt 0) { "HTTP $($Info.StatusCode)" } else { "erreur réseau" }
+    if ($Info.Code) { $status += ", $($Info.Code)" }
+
+    $hint = switch ($Info.StatusCode) {
+        400     { "Requête refusée par l'API (paramètres ou rapport non pris en charge par le tenant)." }
+        401     { "Authentification refusée : vérifiez l'ID d'application et le secret client (expiré ?)." }
+        403     { "Permission insuffisante : accordez à l'application les autorisations Microsoft Graph de type Application DeviceManagementManagedDevices.Read.All et DeviceManagementConfiguration.Read.All, avec consentement administrateur." }
+        404     { "Ressource introuvable (appareil supprimé entre-temps ou point de terminaison indisponible)." }
+        429     { "Limitation de débit (throttling) persistante après $Attempts tentative(s)." }
+        0       { "graph.microsoft.com injoignable (proxy, pare-feu, DNS ou délai dépassé) après $Attempts tentative(s)." }
+        default { if ($Info.StatusCode -ge 500) { "Service Microsoft Graph / Intune indisponible après $Attempts tentative(s)." } else { "" } }
+    }
+
+    $msg = "Échec de l'appel $Method $path ($status) : $($Info.Message)"
+    if ($hint)           { $msg += " $hint" }
+    if ($Info.RequestId) { $msg += " (request-id : $($Info.RequestId))" }
+    return $msg
+}
+
+# Jeton applicatif (client credentials) de la génération en cours : obtenu au
+# premier appel, renouvelé 5 minutes avant expiration ou sur demande (-ForceRefresh).
+# Retourne $null hors génération (les appelants utilisent alors leur -AccessToken).
+function Get-GraphAccessToken {
+    param([switch]$ForceRefresh)
+    $auth = $script:GraphAuth
+    if (-not $auth) { return $null }
+
+    if ($ForceRefresh -or -not $auth.AccessToken -or (Get-Date).ToUniversalTime().AddMinutes(5) -ge $auth.ExpiresAtUtc) {
+        $body = @{ client_id = $auth.ClientId; scope = "https://graph.microsoft.com/.default"; client_secret = $auth.ClientSecret; grant_type = "client_credentials" }
+        $resp = Invoke-GraphApiRequest -NoAuth -Method POST -Uri "https://login.microsoftonline.com/$($auth.TenantId)/oauth2/v2.0/token" `
+                                       -Body $body -ContentType "application/x-www-form-urlencoded" -MaxRetries 2
+        if (-not $resp.access_token) { throw "Réponse d'authentification inattendue : aucun jeton d'accès renvoyé par Microsoft Entra ID." }
+        $lifetime = 3599
+        try { if ($resp.expires_in) { $lifetime = [int]$resp.expires_in } } catch { }
+        $auth.AccessToken  = $resp.access_token
+        $auth.ExpiresAtUtc = (Get-Date).ToUniversalTime().AddSeconds($lifetime)
+    }
+    return $auth.AccessToken
+}
+
+# Appel REST unique avec reprises sur erreur transitoire (voir en-tête de section).
+# -RawText : renvoie le corps décodé en UTF-8 (rapports Intune servis en flux binaire).
+function Invoke-GraphApiRequest {
+    param(
+        [Parameter(Mandatory)][string]$Uri,
+        [ValidateSet('GET', 'POST')][string]$Method = 'GET',
+        [object]$Body = $null,
+        [string]$ContentType = "application/json",
+        [string]$AccessToken = "",
+        [switch]$NoAuth,
+        [switch]$RawText,
+        [int]$MaxRetries = $GraphMaxRetries
+    )
+    $attempt      = 0
+    $tokenRenewed = $false
+    while ($true) {
+        $attempt++
+        $params = @{ Method = $Method; Uri = $Uri; TimeoutSec = $GraphRequestTimeoutSec; ErrorAction = 'Stop' }
+        if (-not $NoAuth) {
+            $token = Get-GraphAccessToken
+            if (-not $token) { $token = $AccessToken }
+            $params.Headers = @{ Authorization = "Bearer $token" }
+        }
+        if ($null -ne $Body) { $params.Body = $Body; $params.ContentType = $ContentType }
+
+        try {
+            if ($RawText) {
+                $web = Invoke-WebRequest @params -UseBasicParsing
+                return [System.Text.Encoding]::UTF8.GetString($web.RawContentStream.ToArray())
+            }
+            return (Invoke-RestMethod @params)
+        } catch {
+            $info = Get-GraphErrorInfo -ErrorRecord $_
+
+            # 401 : jeton expiré ou révoqué -> un seul renouvellement, puis nouvelle tentative
+            if ($info.StatusCode -eq 401 -and -not $NoAuth -and -not $tokenRenewed -and $script:GraphAuth) {
+                $tokenRenewed = $true
+                $renewed = $false
+                try { [void](Get-GraphAccessToken -ForceRefresh); $renewed = $true } catch { }
+                if ($renewed) { continue }
+            }
+
+            $retryable = ($info.StatusCode -in @(429, 500, 502, 503, 504)) -or $info.IsNetworkError
+            if ($retryable -and $attempt -le $MaxRetries) {
+                $delay = if ($info.RetryAfter -gt 0) { [math]::Min($info.RetryAfter, 120) } else { [math]::Min(60, [math]::Pow(2, $attempt)) }
+                $delay = [int][math]::Ceiling($delay)
+                $why   = if ($info.StatusCode -gt 0) { "HTTP $($info.StatusCode)" } else { "erreur réseau" }
+                $path  = $Uri
+                try { $path = ([uri]$Uri).AbsolutePath } catch { }
+                Write-Host "[Graph] $why sur $Method $path - nouvelle tentative $attempt/$MaxRetries dans $delay s" -ForegroundColor DarkYellow
+                Set-UiStatus "⏳ API Graph : $why, nouvelle tentative dans $delay s ($attempt/$MaxRetries)..."
+                Start-Sleep -Seconds $delay
+                continue
+            }
+
+            $ex = [System.Exception]::new((Format-GraphErrorMessage -Info $info -Method $Method -Uri $Uri -Attempts $attempt), $_.Exception)
+            $ex.Data['StatusCode'] = $info.StatusCode
+            $ex.Data['GraphCode']  = $info.Code
+            throw $ex
+        }
+    }
+}
+
+# Code HTTP porté par une exception levée par Invoke-GraphApiRequest (0 si inconnu)
+function Get-GraphExceptionStatus {
+    param([System.Exception]$Exception)
+    $e = $Exception
+    while ($e) {
+        if ($e.Data -and $e.Data.Contains('StatusCode')) { return [int]$e.Data['StatusCode'] }
+        $e = $e.InnerException
+    }
+    return 0
+}
+
 function Get-GraphPagedResults {
     param([string]$Url, [string]$AccessToken)
-    $results = @(); $next = $Url
+    # [v3.3] Reprises (429 / 5xx / réseau) et erreurs explicites déléguées à Invoke-GraphApiRequest
+    $results = [System.Collections.Generic.List[object]]::new()
+    $next    = $Url
     while ($next) {
-        # [MODIF v3] Gestion basique du throttling Graph (HTTP 429) : nécessaire
-        # car l'analyse Root Cause génère un appel API par poste non chiffré.
-        try {
-            $resp = Invoke-RestMethod -Method GET -Uri $next -Headers @{ Authorization = "Bearer $AccessToken" }
-        } catch {
-            $statusCode = 0
-            try { $statusCode = [int]$_.Exception.Response.StatusCode } catch { }
-            if ($statusCode -eq 429) {
-                $retryAfter = 5
-                try { $retryAfter = [int]$_.Exception.Response.Headers['Retry-After'] } catch { }
-                if (-not $retryAfter -or $retryAfter -le 0) { $retryAfter = 5 }
-                Start-Sleep -Seconds $retryAfter
-                continue   # on retente la même URL après la pause
-            }
-            throw
-        }
-        if ($resp.value) { $results += $resp.value }
+        $resp = Invoke-GraphApiRequest -Method GET -Uri $next -AccessToken $AccessToken
+        if ($resp.value) { foreach ($item in $resp.value) { $results.Add($item) } }
         $next = $resp.'@odata.nextLink'
     }
-    return $results
+    return $results.ToArray()
+}
+
+# Convertit la réponse d'un rapport Intune (flux JSON binaire ou texte) en objet
+function ConvertFrom-GraphReportPayload {
+    param([object]$Payload)
+    if ($null -eq $Payload) { return $null }
+    if ($Payload -is [byte[]]) { $Payload = [System.Text.Encoding]::UTF8.GetString($Payload) }
+    if ($Payload -is [string]) {
+        $text = $Payload.Trim([char]0xFEFF, ' ', "`r", "`n", "`t")
+        if (-not $text) { return $null }
+        return ($text | ConvertFrom-Json)
+    }
+    return $Payload
+}
+
+# Interroge un rapport Intune (actions beta/deviceManagement/reports/get...Report).
+# Réponse : { TotalRowCount, Schema: [{ Column }], Values: [[...]] }, paginée par skip/top.
+# Retourne { Columns; Rows } où chaque ligne est un objet nommé selon le schéma.
+function Invoke-GraphReportQuery {
+    param([Parameter(Mandatory)][string]$ReportName, [string]$AccessToken, [int]$PageSize = 500, [int]$MaxPages = 1000)
+
+    $uri     = "https://graph.microsoft.com/beta/deviceManagement/reports/$ReportName"
+    $columns = $null
+    $rows    = [System.Collections.Generic.List[object]]::new()
+    $skip    = 0
+    $total   = -1
+    for ($page = 1; $page -le $MaxPages; $page++) {
+        $body = @{ skip = $skip; top = $PageSize } | ConvertTo-Json -Compress
+        $resp = ConvertFrom-GraphReportPayload (Invoke-GraphApiRequest -Method POST -Uri $uri -Body $body -AccessToken $AccessToken -RawText)
+        if ($null -eq $resp -or $null -eq $resp.Schema) { throw "Réponse inattendue du rapport $ReportName (schéma de colonnes absent)." }
+
+        if ($null -eq $columns) { $columns = @($resp.Schema | ForEach-Object { [string]$_.Column }) }
+        if ($null -ne $resp.TotalRowCount) { $total = [int]$resp.TotalRowCount }
+
+        $values = if ($null -eq $resp.Values) { @() } else { @($resp.Values) }
+        foreach ($v in $values) {
+            $o = [ordered]@{}
+            for ($i = 0; $i -lt $columns.Count; $i++) { $o[$columns[$i]] = $v[$i] }
+            $rows.Add([pscustomobject]$o)
+        }
+        $skip += $values.Count
+
+        # Fin : page vide, total atteint, ou (total inconnu) page incomplète
+        if ($values.Count -eq 0 -or ($total -ge 0 -and $skip -ge $total) -or ($total -lt 0 -and $values.Count -lt $PageSize)) { break }
+    }
+    return [pscustomobject]@{ Columns = [string[]]$columns; Rows = $rows }
 }
 
 # ========================================
 # [MODIF v3] ANALYSE DES CAUSES DE NON-CONFORMITÉ (ROOT CAUSE)
 # ========================================
 
+# [v3.3] Table unique de traduction des paramètres de conformité Intune en
+# libellés lisibles, classés par catégorie. Utilisée par la colonne "RootCause"
+# (section "Non Encrypted") et par l'analyse des non-conformités.
+# Reconnaît les noms techniques (ex. "Windows10CompliancePolicy.BitLockerEnabled")
+# et les libellés anglais des rapports Intune (ex. "Is active", "Minimum OS version"),
+# ce qui reprend la table $ErrorLabelMap du script de référence.
+# Ordre significatif : la première règle qui correspond l'emporte.
+$ComplianceReasonRules = @(
+    @{ Pattern = 'BitLocker';                                                          Category = 'Chiffrement';              Reason = 'Chiffrement BitLocker désactivé' }
+    @{ Pattern = 'StorageRequireEncryption|RequireEncryption|Encryption of data storage'; Category = 'Chiffrement';           Reason = 'Chiffrement du stockage non conforme' }
+    @{ Pattern = 'Firewall';                                                           Category = 'Pare-feu';                 Reason = 'Pare-feu (Firewall) inactif' }
+    @{ Pattern = 'OsMinimumVersion|Minimum OS version';                                Category = "Système d'exploitation";   Reason = 'Version OS obsolète (< minimum requis)' }
+    @{ Pattern = 'OsMaximumVersion|Maximum OS version';                                Category = "Système d'exploitation";   Reason = 'Version OS non autorisée (> maximum)' }
+    @{ Pattern = 'ValidOperatingSystemBuildRanges|Valid operating system build';       Category = "Système d'exploitation";   Reason = 'Build OS hors plage autorisée' }
+    @{ Pattern = 'Defender|AntiVirus|AntiSpyware|Antimalware';                         Category = 'Antivirus & menaces';      Reason = 'Antivirus / Defender non conforme' }
+    @{ Pattern = 'RtpEnabled|Real-time protection';                                    Category = 'Antivirus & menaces';      Reason = 'Protection temps réel désactivée' }
+    @{ Pattern = 'SignatureOutOfDate';                                                 Category = 'Antivirus & menaces';      Reason = 'Signatures antivirus obsolètes' }
+    @{ Pattern = 'SecureBoot|Secure Boot';                                             Category = "Intégrité de l'appareil";  Reason = 'Secure Boot désactivé' }
+    @{ Pattern = 'Tpm|Trusted Platform Module';                                        Category = "Intégrité de l'appareil";  Reason = 'TPM requis absent ou désactivé' }
+    @{ Pattern = 'CodeIntegrity|Code integrity';                                       Category = "Intégrité de l'appareil";  Reason = 'Intégrité du code non conforme' }
+    @{ Pattern = 'Password|Passcode';                                                  Category = 'Mot de passe';             Reason = 'Stratégie de mot de passe non conforme' }
+    @{ Pattern = 'DeviceThreatProtection|threat level';                                Category = 'Antivirus & menaces';      Reason = 'Niveau de menace appareil trop élevé' }
+    @{ Pattern = 'RequireRemainContact|^\s*Is ?active\s*$';                            Category = 'Inscription & activité';   Reason = 'Perte de contact Intune (poste inactif)' }
+    @{ Pattern = 'RequireDeviceCompliancePolicyAssigned|compliance policy assigned';   Category = 'Inscription & activité';   Reason = 'Aucune stratégie de conformité assignée' }
+    @{ Pattern = 'RequireUserExistence|Enrolled user exists';                          Category = 'Inscription & activité';   Reason = 'Utilisateur inscrit introuvable' }
+    @{ Pattern = 'Jailbroken|Jailbreak|Rooted';                                        Category = "Intégrité de l'appareil";  Reason = 'Appareil jailbreaké / rooté' }
+)
+
+# [v3.3] Catégorie + raison d'un paramètre en écart. Le nom technique ($Setting)
+# est essayé en premier (stable, indépendant de la langue), puis le libellé
+# ($SettingName). Paramètre inconnu : libellé brut, catégorie "Autre".
+function Get-ComplianceReasonInfo {
+    param([string]$Setting, [string]$SettingName)
+    foreach ($candidate in @($Setting, $SettingName)) {
+        if ([string]::IsNullOrWhiteSpace($candidate)) { continue }
+        foreach ($rule in $ComplianceReasonRules) {
+            if ($candidate -match $rule.Pattern) { return [pscustomobject]@{ Category = $rule.Category; Reason = $rule.Reason } }
+        }
+    }
+    $raw = if (-not [string]::IsNullOrWhiteSpace($SettingName)) { $SettingName } else { $Setting }
+    if ([string]::IsNullOrWhiteSpace($raw)) { return $null }
+    return [pscustomobject]@{ Category = 'Autre'; Reason = $raw.Trim() }
+}
+
 # [MODIF v3] Traduit un paramètre de conformité Intune (settingName brut,
 # ex: "Windows10CompliancePolicy.BitLockerEnabled") en libellé lisible
 # pour la colonne "RootCause" du dashboard.
+# [v3.3] S'appuie sur la table $ComplianceReasonRules (mêmes libellés qu'en v3).
 function Get-FriendlyComplianceReason {
     param([string]$Setting, [string]$SettingName)
-
-    # On privilégie settingName (ex: "BitLockerEnabled"), sinon le chemin complet
-    $raw = if (-not [string]::IsNullOrWhiteSpace($SettingName)) { $SettingName } else { $Setting }
-    if ([string]::IsNullOrWhiteSpace($raw)) { return $null }
-
-    switch -Regex ($raw) {
-        'BitLocker'                                  { return "Chiffrement BitLocker désactivé" }
-        'StorageRequireEncryption|RequireEncryption' { return "Chiffrement du stockage non conforme" }
-        'Firewall'                                   { return "Pare-feu (Firewall) inactif" }
-        'OsMinimumVersion'                           { return "Version OS obsolète (< minimum requis)" }
-        'OsMaximumVersion'                           { return "Version OS non autorisée (> maximum)" }
-        'ValidOperatingSystemBuildRanges'            { return "Build OS hors plage autorisée" }
-        'Defender|AntiVirus|AntiSpyware'             { return "Antivirus / Defender non conforme" }
-        'RtpEnabled'                                 { return "Protection temps réel désactivée" }
-        'SignatureOutOfDate'                         { return "Signatures antivirus obsolètes" }
-        'SecureBoot'                                 { return "Secure Boot désactivé" }
-        'Tpm'                                        { return "TPM requis absent ou désactivé" }
-        'CodeIntegrity'                              { return "Intégrité du code non conforme" }
-        'Password'                                   { return "Stratégie de mot de passe non conforme" }
-        'DeviceThreatProtection'                     { return "Niveau de menace appareil trop élevé" }
-        'RequireRemainContact'                       { return "Perte de contact Intune (poste inactif)" }
-        'RequireDeviceCompliancePolicyAssigned'      { return "Aucune stratégie de conformité assignée" }
-        'RequireUserExistence'                       { return "Utilisateur inscrit introuvable" }
-        'Jailbroken|Rooted'                          { return "Appareil jailbreaké / rooté" }
-        default                                      { return $raw }   # libellé brut si paramètre inconnu
-    }
+    $info = Get-ComplianceReasonInfo -Setting $Setting -SettingName $SettingName
+    if ($info) { return $info.Reason }
+    return $null
 }
 
-# [MODIF v3] Récupère, pour un appareil donné, la liste des raisons précises de
-# non-conformité via l'API Graph :
+# [v3.3] Paramètres en écart d'un appareil, via l'API Graph :
 #   1) /managedDevices/{id}/deviceCompliancePolicyStates          (état par stratégie)
-#   2) .../deviceCompliancePolicyStates/{policyId}/settingStates  (détail par paramètre)
+#   2) .../deviceCompliancePolicyStates/{policyId}/settingStates  (détail par paramètre,
+#      appelé seulement s'il n'est pas déjà fourni dans la réponse n°1)
 # Endpoint beta requis pour obtenir le détail settingStates de manière fiable.
-# Retourne un tableau de libellés, causes liées au chiffrement en premier.
+# Retourne une ligne par paramètre en écart (ou par stratégie si le détail est
+# indisponible). Une erreur API sur la liste des stratégies est propagée à
+# l'appelant. Résultat mis en cache pour la génération en cours : la section
+# "Non Encrypted" réutilise ainsi les postes déjà analysés.
+$script:NcSettingsCache = $null
+$NcBadStates = @('nonCompliant', 'error', 'conflict')
+
+function Get-DeviceNonComplianceSettings {
+    param(
+        [Parameter(Mandatory)][string]$DeviceId,
+        [Parameter(Mandatory)][string]$AccessToken
+    )
+    if ($null -ne $script:NcSettingsCache -and $script:NcSettingsCache.ContainsKey($DeviceId)) {
+        return $script:NcSettingsCache[$DeviceId]
+    }
+    $rows = [System.Collections.Generic.List[object]]::new()
+
+    # 1) États des stratégies de conformité de l'appareil
+    $polUri       = "https://graph.microsoft.com/beta/deviceManagement/managedDevices/$DeviceId/deviceCompliancePolicyStates"
+    $policyStates = Get-GraphPagedResults -Url $polUri -AccessToken $AccessToken
+
+    foreach ($pol in @($policyStates)) {
+        # On ne détaille que les stratégies en écart (nonCompliant / error / conflict)
+        if ("$($pol.state)" -notin $NcBadStates) { continue }
+
+        # 2) Détail des paramètres (settingStates) de la stratégie en écart
+        $settingStates = @($pol.settingStates | Where-Object { $null -ne $_ })
+        if ($settingStates.Count -eq 0 -and $pol.id) {
+            try {
+                $ssUri         = "https://graph.microsoft.com/beta/deviceManagement/managedDevices/$DeviceId/deviceCompliancePolicyStates/$($pol.id)/settingStates"
+                $settingStates = @(Get-GraphPagedResults -Url $ssUri -AccessToken $AccessToken)
+            } catch { $settingStates = @() }
+        }
+
+        $badSettings = @($settingStates | Where-Object { "$($_.state)" -in $NcBadStates })
+        if ($badSettings.Count -gt 0) {
+            foreach ($s in $badSettings) {
+                $rows.Add([pscustomobject]@{ PolicyName = "$($pol.displayName)"; Setting = "$($s.setting)"; SettingLabel = "$($s.settingName)"; State = "$($s.state)" })
+            }
+        } else {
+            # Pas de granularité disponible : on remonte au moins la stratégie fautive
+            $rows.Add([pscustomobject]@{ PolicyName = "$($pol.displayName)"; Setting = ""; SettingLabel = ""; State = "$($pol.state)" })
+        }
+    }
+
+    $result = $rows.ToArray()
+    if ($null -ne $script:NcSettingsCache) { $script:NcSettingsCache[$DeviceId] = $result }
+    return $result
+}
+
+# [MODIF v3] Liste des raisons précises de non-conformité d'un appareil
+# (colonne "RootCause"). Retourne un tableau de libellés, causes liées au
+# chiffrement en premier.
 function Get-DeviceNonComplianceReasons {
     param(
         [Parameter(Mandatory)][string]$DeviceId,
@@ -988,33 +1383,11 @@ function Get-DeviceNonComplianceReasons {
     )
     $reasons = [System.Collections.Generic.List[string]]::new()
     try {
-        # 1) États des stratégies de conformité de l'appareil
-        $polUri       = "https://graph.microsoft.com/beta/deviceManagement/managedDevices/$DeviceId/deviceCompliancePolicyStates"
-        $policyStates = Get-GraphPagedResults -Url $polUri -AccessToken $AccessToken
-
-        foreach ($pol in $policyStates) {
-            # On ne détaille que les stratégies en écart (nonCompliant / error / conflict)
-            if ($pol.state -notin @('nonCompliant', 'error', 'conflict')) { continue }
-
-            # 2) Détail des paramètres (settingStates) de la stratégie en écart
-            $settingStates = @()
-            try {
-                $ssUri         = "https://graph.microsoft.com/beta/deviceManagement/managedDevices/$DeviceId/deviceCompliancePolicyStates/$($pol.id)/settingStates"
-                $settingStates = Get-GraphPagedResults -Url $ssUri -AccessToken $AccessToken
-            } catch { }
-
-            $badSettings = @($settingStates | Where-Object { $_.state -in @('nonCompliant', 'error', 'conflict') })
-
-            if ($badSettings.Count -gt 0) {
-                foreach ($s in $badSettings) {
-                    $label = Get-FriendlyComplianceReason -Setting $s.setting -SettingName $s.settingName
-                    if ($label -and -not $reasons.Contains($label)) { [void]$reasons.Add($label) }
-                }
-            } else {
-                # Pas de granularité disponible : on remonte au moins la stratégie fautive
-                $label = "Non conforme : $($pol.displayName)"
-                if (-not $reasons.Contains($label)) { [void]$reasons.Add($label) }
-            }
+        foreach ($s in @(Get-DeviceNonComplianceSettings -DeviceId $DeviceId -AccessToken $AccessToken)) {
+            $label = $null
+            if ($s.Setting -or $s.SettingLabel) { $label = Get-FriendlyComplianceReason -Setting $s.Setting -SettingName $s.SettingLabel }
+            if (-not $label) { $label = "Non conforme : $($s.PolicyName)" }
+            if (-not $reasons.Contains($label)) { [void]$reasons.Add($label) }
         }
     } catch {
         # Une erreur API sur un poste ne doit pas interrompre la génération du dashboard
@@ -1022,6 +1395,744 @@ function Get-DeviceNonComplianceReasons {
 
     # Priorité d'affichage : causes liées au chiffrement en premier
     return @($reasons | Sort-Object { if ($_ -match 'BitLocker|Chiffrement') { 0 } else { 1 } })
+}
+
+# ========================================
+# [v3.3] ANALYSE DES NON-CONFORMITÉS (CATÉGORIES / RAISONS) VIA L'API GRAPH
+# ========================================
+# Reprise de la logique du script de référence "Non_compliant.ps1", qui lisait
+# un export manuel (CSV / XLSX) : classement par catégorie et par raison,
+# ancienneté de synchronisation, actionnabilité, tri par urgence, synthèses et
+# CSV. Les données sont désormais interrogées en direct, sans fichier :
+#   1) rapport Intune "Noncompliant devices and settings" (tout le tenant) :
+#      POST beta/deviceManagement/reports/getNoncompliantDevicesAndSettingsReport
+#   2) repli automatique appareil par appareil si le rapport est indisponible :
+#      GET beta/deviceManagement/managedDevices/{id}/deviceCompliancePolicyStates
+# Aucune erreur de cette analyse n'interrompt la génération du dashboard : elle
+# est affichée dans la section et dans le message de fin.
+
+$NcLblVert          = "0 à $NcSeuilVert jours"
+$NcLblOrange        = "$($NcSeuilVert + 1) à $NcSeuilOrange jours"
+$NcLblRouge         = "$NcSeuilRouge jours et +"
+$NcSyncOrder        = @($NcLblVert, $NcLblOrange, $NcLblRouge)
+$NcLabelActionnable = "Actionnable"
+$NcLabelImpossible  = "Action impossible (hors réseau)"
+$NcPrioHaute        = "1 - Priorité haute (synchro ≤ $NcSeuilVert j)"
+$NcPrioATraiter     = "2 - À traiter (synchro $($NcSeuilVert + 1)-$NcSeuilOrange j)"
+$NcPrioHorsReseau   = "3 - Hors réseau (action impossible)"
+$NcPrioFantome      = "4 - Poste fantôme (synchro ≥ $NcSeuilRouge j)"
+$NcCategoryOther    = "Autre"
+$NcCategoryUnknown  = "Non déterminée"
+$NcReasonNotReported = "Raison non remontée par Intune"
+$NcReasonApiError    = "Analyse impossible (erreur API)"
+$NcSourceReport      = "Rapport Intune « Noncompliant devices and settings » (API Graph)"
+$NcSourcePerDevice   = "API Graph, détail par appareil (deviceCompliancePolicyStates)"
+$NcIgnoredStatuses   = @('compliant', 'conforme', 'not applicable', 'notapplicable', 'non applicable')
+
+# Colonnes du rapport Intune : les noms varient selon la version du service
+# (ex. "SettingNm_loc" / "SettingName"). Correspondance insensible à la casse, aux
+# accents et à la ponctuation, dans l'ordre de priorité des alias (repris du
+# $ColumnAliases du script de référence).
+$NcReportColumnAliases = [ordered]@{
+    DeviceId      = @("intunedeviceid", "deviceid", "device id", "managed device id")
+    DeviceName    = @("devicename", "device name", "nom du poste", "nom de l'appareil", "computername", "hostname")
+    User          = @("upn", "userprincipalname", "user principal name", "primaryuserupn", "useremail", "user email", "utilisateur (upn)")
+    SettingLabel  = @("settingnm loc", "settingname loc", "setting name loc", "settingdisplayname", "setting display name")
+    Setting       = @("settingname", "setting name", "settingnm", "setting nm", "settingid", "setting id", "parametre intune")
+    Policy        = @("policyname", "policy name", "politique", "strategie")
+    SettingStatus = @("settingstatus loc", "settingstatus", "setting status", "statut parametre")
+    Compliance    = @("compliancestate loc", "compliancestate", "compliance state", "etat conformite")
+    OS            = @("os loc", "os", "operatingsystem", "operating system", "platform", "plateforme")
+    LastSync      = @("lastcontact", "last contact", "lastsyncdatetime", "last sync", "derniere synchro")
+}
+
+# Minuscules, sans accents ni ponctuation (repris du script de référence)
+function Get-NormalizedKey {
+    param([object]$Text)
+    if ($null -eq $Text) { return "" }
+    $s  = ([string]$Text).Trim().ToLowerInvariant().Normalize([Text.NormalizationForm]::FormD)
+    $sb = New-Object System.Text.StringBuilder
+    foreach ($c in $s.ToCharArray()) {
+        if ([Globalization.CharUnicodeInfo]::GetUnicodeCategory($c) -ne [Globalization.UnicodeCategory]::NonSpacingMark) { [void]$sb.Append($c) }
+    }
+    return (($sb.ToString() -replace '[^a-z0-9]+', ' ').Trim())
+}
+
+# Ensemble de clés (postes) insensible à la casse
+function New-NcKeySet {
+    return , ([System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase))
+}
+
+# Fait correspondre les colonnes logiques aux colonnes renvoyées par le rapport.
+# Deux passes (reprises du script de référence) : correspondances exactes, puis
+# correspondances partielles sur les colonnes encore libres.
+function Resolve-NcReportColumns {
+    param([string[]]$Headers)
+    $normalized = @{}
+    foreach ($h in $Headers) {
+        $k = Get-NormalizedKey $h
+        if ($k -and -not $normalized.ContainsKey($k)) { $normalized[$k] = $h }
+    }
+    $map  = @{}
+    $used = New-NcKeySet
+
+    # Passe 1 : correspondances exactes
+    foreach ($logical in $NcReportColumnAliases.Keys) {
+        $map[$logical] = $null
+        foreach ($alias in $NcReportColumnAliases[$logical]) {
+            $ak = Get-NormalizedKey $alias
+            if ($ak -and $normalized.ContainsKey($ak) -and -not $used.Contains($ak)) {
+                $map[$logical] = $normalized[$ak]; [void]$used.Add($ak); break
+            }
+        }
+    }
+    # Passe 2 : correspondances partielles (alias de 6 caractères et plus, pour que
+    # "os" ne capte pas "osversion" ; jamais pour l'identifiant, "aaddeviceid" != "deviceid")
+    foreach ($logical in $NcReportColumnAliases.Keys) {
+        if ($map[$logical] -or $logical -eq 'DeviceId') { continue }
+        foreach ($alias in $NcReportColumnAliases[$logical]) {
+            $ak = Get-NormalizedKey $alias
+            if ($ak.Length -lt 6) { continue }
+            $hit = $normalized.Keys | Where-Object { -not $used.Contains($_) -and $_ -like "*$ak*" } | Sort-Object Length | Select-Object -First 1
+            if ($hit) { $map[$logical] = $normalized[$hit]; [void]$used.Add($hit); break }
+        }
+    }
+    return $map
+}
+
+# Valeur d'une colonne logique d'une ligne de rapport ($null si colonne absente)
+function Get-NcCell {
+    param([object]$Row, [hashtable]$Map, [string]$Name)
+    if ($Map[$Name]) { return $Row.($Map[$Name]) }
+    return $null
+}
+
+# Date hétérogène (DateTime, DateTimeOffset, ISO 8601, JJ/MM/AAAA) -> DateTime UTC.
+# $null si vide ou antérieure à 2000 (Intune renvoie 0001-01-01 pour "jamais").
+function ConvertTo-NcUtcDate {
+    param([object]$Value)
+    if ($null -eq $Value) { return $null }
+    $d = $null
+    if ($Value -is [DateTimeOffset]) {
+        $d = $Value.UtcDateTime
+    } elseif ($Value -is [datetime]) {
+        if ($Value.Kind -eq [DateTimeKind]::Local) { $d = $Value.ToUniversalTime() }
+        else { $d = [datetime]::SpecifyKind($Value, [DateTimeKind]::Utc) }   # Graph : UTC
+    } else {
+        $s = ([string]$Value).Trim()
+        if (-not $s -or $s -in @('-', 'N/A', 'null', 'None', 'Never', 'Jamais')) { return $null }
+        $dto = [DateTimeOffset]::MinValue
+        if ($s -match '^\d{4}-\d{2}-\d{2}') {
+            if ([DateTimeOffset]::TryParse($s, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::AssumeUniversal, [ref]$dto)) { $d = $dto.UtcDateTime }
+        } elseif ([DateTimeOffset]::TryParse($s, [Globalization.CultureInfo]::GetCultureInfo('fr-FR'), [Globalization.DateTimeStyles]::AssumeLocal, [ref]$dto)) {
+            $d = $dto.UtcDateTime
+        }
+    }
+    if ($null -eq $d -or $d.Year -lt 2000) { return $null }
+    return $d
+}
+
+# DateTime UTC -> "JJ/MM/AAAA HH:MM" en heure locale (vide si $null)
+function Format-NcDate {
+    param([object]$UtcDate)
+    if ($null -eq $UtcDate) { return "" }
+    return $UtcDate.ToLocalTime().ToString('dd/MM/yyyy HH:mm', [Globalization.CultureInfo]::InvariantCulture)
+}
+
+# Traduction des états Intune (nonCompliant, error, conflict...) en français
+function ConvertTo-NcStateLabel {
+    param([object]$Value)
+    $raw = ([string]$Value).Trim()
+    switch (Get-NormalizedKey $raw) {
+        { $_ -in @('noncompliant', 'not compliant') }      { return 'Non conforme' }
+        'error'                                            { return 'Erreur' }
+        'conflict'                                         { return 'Conflit' }
+        { $_ -in @('ingraceperiod', 'in grace period') }   { return 'Période de grâce' }
+        'compliant'                                        { return 'Conforme' }
+        { $_ -in @('notapplicable', 'not applicable') }    { return 'Non applicable' }
+        'unknown'                                          { return 'Inconnu' }
+        default                                            { return $raw }
+    }
+}
+
+# Pourcentage formaté selon la culture courante (virgule décimale en français)
+function Format-NcPercent {
+    param([double]$Part, [double]$Total)
+    if ($Total -le 0) { return ('{0:0.0}' -f 0) }
+    return ('{0:0.0}' -f (100.0 * $Part / $Total))
+}
+
+# Ligne brute "poste x paramètre en écart". Les propriétés de l'appareil géré
+# (nom, UPN, OS, dernière synchro) font foi ; celles du rapport servent de repli.
+function New-NcRawRow {
+    param(
+        [object]$Device,
+        [string]$PolicyName = "", [string]$Setting = "", [string]$SettingLabel = "", [string]$SettingStatus = "",
+        [string]$Reason = "", [string]$Category = "",
+        [hashtable]$Fallback = @{}
+    )
+    $pick = {
+        param($Primary, $Secondary)
+        if (-not [string]::IsNullOrWhiteSpace("$Primary")) { return "$Primary".Trim() }
+        if (-not [string]::IsNullOrWhiteSpace("$Secondary")) { return "$Secondary".Trim() }
+        return ""
+    }
+    $lastSync = ConvertTo-NcUtcDate $Device.LastSyncDateTime
+    if ($null -eq $lastSync) { $lastSync = ConvertTo-NcUtcDate $Fallback.LastSync }
+
+    return [pscustomobject]@{
+        DeviceKey         = "$($Device.Id)"
+        DeviceName        = & $pick $Device.DeviceName        $Fallback.Name
+        UserPrincipalName = & $pick $Device.UserPrincipalName $Fallback.User
+        OperatingSystem   = & $pick $Device.OperatingSystem   $Fallback.OS
+        ComplianceState   = & $pick $Device.ComplianceState   $Fallback.Compliance
+        PolicyName        = $PolicyName.Trim()
+        Setting           = $Setting.Trim()
+        SettingLabel      = $SettingLabel.Trim()
+        SettingStatus     = $SettingStatus.Trim()
+        Reason            = $Reason
+        Category          = $Category
+        LastSyncUtc       = $lastSync
+    }
+}
+
+# Source 1 : rapport Intune "Noncompliant devices and settings" pour tout le
+# tenant, restreint aux postes non conformes du périmètre (exclusion des VM...).
+# Lève une exception si le rapport est indisponible ou de structure inconnue.
+function Get-NcRowsFromReport {
+    param([object[]]$Devices, [string]$AccessToken)
+
+    $report = Invoke-GraphReportQuery -ReportName 'getNoncompliantDevicesAndSettingsReport' -AccessToken $AccessToken -PageSize $NcReportPageSize
+    $rows   = [System.Collections.Generic.List[object]]::new()
+    if ($report.Rows.Count -eq 0) { return [pscustomobject]@{ Rows = $rows; OutOfScope = 0 } }
+
+    $map     = Resolve-NcReportColumns -Headers $report.Columns
+    $colList = $report.Columns -join ', '
+    if (-not ($map.DeviceId -or $map.DeviceName)) { throw "Structure du rapport non reconnue : aucune colonne identifiant le poste (colonnes reçues : $colList)." }
+    if (-not ($map.Setting -or $map.SettingLabel)) { throw "Structure du rapport non reconnue : aucune colonne de paramètre de conformité (colonnes reçues : $colList)." }
+
+    # Index des postes du périmètre : identifiant Intune, sinon nom
+    $byId   = @{}
+    $byName = @{}
+    foreach ($d in $Devices) {
+        if ($d.Id) { $byId["$($d.Id)".ToLowerInvariant()] = $d }
+        $n = "$($d.DeviceName)".Trim().ToLowerInvariant()
+        if ($n -and -not $byName.ContainsKey($n)) { $byName[$n] = $d }
+    }
+
+    $seen       = New-NcKeySet
+    $outOfScope = 0
+    foreach ($r in $report.Rows) {
+        # Paramètres conformes / non applicables : hors sujet
+        $status = Get-NcCell $r $map 'SettingStatus'
+        if ($null -ne $status -and (Get-NormalizedKey $status) -in $NcIgnoredStatuses) { continue }
+
+        $dev = $null
+        $id  = "$(Get-NcCell $r $map 'DeviceId')".Trim().ToLowerInvariant()
+        if ($id -and $byId.ContainsKey($id)) { $dev = $byId[$id] }
+        if (-not $dev) {
+            $n = "$(Get-NcCell $r $map 'DeviceName')".Trim().ToLowerInvariant()
+            if ($n -and $byName.ContainsKey($n)) { $dev = $byName[$n] }
+        }
+        # Poste hors périmètre : VM exclue, période de grâce, conforme depuis...
+        if (-not $dev) { $outOfScope++; continue }
+
+        $policy  = "$(Get-NcCell $r $map 'Policy')".Trim()
+        $setting = "$(Get-NcCell $r $map 'Setting')".Trim()
+        $label   = "$(Get-NcCell $r $map 'SettingLabel')".Trim()
+        if (-not $setting -and -not $label) { continue }
+        if (-not $seen.Add(("{0}|{1}|{2}|{3}" -f $dev.Id, $policy, $setting, $label))) { continue }   # doublon
+
+        $fallback = @{
+            Name       = Get-NcCell $r $map 'DeviceName'
+            User       = Get-NcCell $r $map 'User'
+            OS         = Get-NcCell $r $map 'OS'
+            Compliance = Get-NcCell $r $map 'Compliance'
+            LastSync   = Get-NcCell $r $map 'LastSync'
+        }
+        $rows.Add((New-NcRawRow -Device $dev -PolicyName $policy -Setting $setting -SettingLabel $label -SettingStatus "$status" -Fallback $fallback))
+    }
+    return [pscustomobject]@{ Rows = $rows; OutOfScope = $outOfScope }
+}
+
+# Source 2 (repli) : paramètres en écart, appareil par appareil. Un poste en
+# erreur API est conservé avec la raison "Analyse impossible (erreur API)" ;
+# une erreur 401 / 403 (droits) interrompt l'analyse : elle toucherait tous les postes.
+function Get-NcRowsPerDevice {
+    param([object[]]$Devices, [string]$AccessToken, [System.Collections.Generic.List[string]]$Warnings)
+
+    $rows      = [System.Collections.Generic.List[object]]::new()
+    $failed    = 0
+    $lastError = ""
+    $idx       = 0
+    foreach ($dev in $Devices) {
+        $idx++
+        if ($idx -eq 1 -or $idx % 5 -eq 0 -or $idx -eq $Devices.Count) {
+            Set-UiStatus "🧩 Non-conformités : analyse par appareil $idx / $($Devices.Count)..."
+        }
+        try {
+            $settings = @(Get-DeviceNonComplianceSettings -DeviceId "$($dev.Id)" -AccessToken $AccessToken)
+        } catch {
+            if ((Get-GraphExceptionStatus $_.Exception) -in @(401, 403)) { throw }
+            $failed++
+            $lastError = $_.Exception.Message
+            $rows.Add((New-NcRawRow -Device $dev -Reason $NcReasonApiError -Category $NcCategoryUnknown))
+            continue
+        }
+        foreach ($s in $settings) {
+            $rows.Add((New-NcRawRow -Device $dev -PolicyName $s.PolicyName -Setting $s.Setting -SettingLabel $s.SettingLabel -SettingStatus $s.State))
+        }
+    }
+    if ($failed -gt 0) {
+        if ($failed -eq $Devices.Count) { throw "Aucun des $failed poste(s) non conforme(s) n'a pu être analysé via l'API Graph. Dernière erreur : $lastError" }
+        $Warnings.Add("$failed poste(s) sur $($Devices.Count) n'ont pas pu être analysés : ils apparaissent avec la raison « $NcReasonApiError ». Dernière erreur : $lastError")
+    }
+    return $rows.ToArray()
+}
+
+# Traitement (repris d'Invoke-DataProcessing du script de référence) : catégorie
+# et raison, ancienneté de synchronisation, tranche, actionnabilité, puis tri
+# du plus urgent (synchro la plus récente = corrigeable maintenant) au moins urgent.
+function Invoke-NcDataProcessing {
+    param([object[]]$Rows, [datetime]$NowUtc)
+
+    $patterns = @($NcKeywordsHorsReseau | ForEach-Object { Get-NormalizedKey $_ } | Where-Object { $_ })
+    $out      = [System.Collections.Generic.List[object]]::new()
+
+    foreach ($r in $Rows) {
+        # --- Catégorie et raison ---
+        $category = $r.Category
+        $reason   = $r.Reason
+        if (-not $reason) {
+            $info = Get-ComplianceReasonInfo -Setting $r.Setting -SettingName $r.SettingLabel
+            if ($info)             { $category = $info.Category; $reason = $info.Reason }
+            elseif ($r.PolicyName) { $category = $NcCategoryUnknown; $reason = "Non conforme : $($r.PolicyName)" }
+            else                   { $category = $NcCategoryUnknown; $reason = $NcReasonNotReported }
+        }
+        if (-not $category) { $category = $NcCategoryOther }
+
+        # --- Ancienneté de synchronisation (jamais synchronisé = poste fantôme) ---
+        $days = $null
+        if ($r.LastSyncUtc) {
+            $days = [int][math]::Floor(($NowUtc - $r.LastSyncUtc).TotalDays)
+            if ($days -lt 0) { $days = 0 }   # marge sur les fuseaux horaires
+        }
+        $daysRule   = if ($null -eq $days) { [int]::MaxValue } else { $days }
+        $syncStatus = if ($daysRule -le $NcSeuilVert) { $NcLblVert } elseif ($daysRule -le $NcSeuilOrange) { $NcLblOrange } else { $NcLblRouge }
+
+        # --- Actionnabilité : erreur "réseau" sur un poste hors ligne depuis > 15 jours ---
+        $haystack = Get-NormalizedKey ("{0} {1} {2}" -f $reason, $r.Setting, $r.SettingLabel)
+        $isReseau = $false
+        foreach ($p in $patterns) { if ($haystack.Contains($p)) { $isReseau = $true; break } }
+        $action = if ($daysRule -gt $NcSeuilHorsReseau -and $isReseau) { $NcLabelImpossible } else { $NcLabelActionnable }
+
+        $settingShown = if ($r.Setting) { $r.Setting } else { $r.SettingLabel }
+        $out.Add([pscustomobject]@{
+            DeviceKey         = $r.DeviceKey
+            DeviceName        = $r.DeviceName
+            UserPrincipalName = $r.UserPrincipalName
+            OperatingSystem   = $r.OperatingSystem
+            Category          = $category
+            Reason            = $reason
+            Setting           = $settingShown
+            PolicyName        = $r.PolicyName
+            SettingStatus     = ConvertTo-NcStateLabel $r.SettingStatus
+            ComplianceState   = ConvertTo-NcStateLabel $r.ComplianceState
+            LastSyncUtc       = $r.LastSyncUtc
+            DaysSinceSync     = $days
+            SyncStatus        = $syncStatus
+            Action            = $action
+        })
+    }
+
+    return @($out | Sort-Object @{ Expression = { if ($null -eq $_.DaysSinceSync) { [int]::MaxValue } else { $_.DaysSinceSync } } },
+                                @{ Expression = 'DeviceName' }, @{ Expression = 'Category' }, @{ Expression = 'Reason' })
+}
+
+# Indicateurs du tableau de bord (repris de Get-ComplianceKpi) : postes uniques
+function Get-NcKpi {
+    param([object[]]$Rows)
+
+    $all = New-NcKeySet; $traitables = New-NcKeySet; $vert = New-NcKeySet; $orange = New-NcKeySet
+    $fantomes = New-NcKeySet; $rouge30 = New-NcKeySet; $horsReseau = New-NcKeySet
+    $minDays = @{}
+
+    foreach ($r in $Rows) {
+        $k  = [string]$r.DeviceKey
+        $d  = if ($null -eq $r.DaysSinceSync) { [int]::MaxValue } else { [int]$r.DaysSinceSync }
+        $ok = $r.Action -eq $NcLabelActionnable
+        [void]$all.Add($k)
+        if ($ok -and $d -lt $NcSeuilRouge) {
+            [void]$traitables.Add($k)
+            if ($d -le $NcSeuilVert) { [void]$vert.Add($k) } else { [void]$orange.Add($k) }
+        }
+        if ($d -ge $NcSeuilRouge -or -not $ok)   { [void]$fantomes.Add($k) }
+        if ($d -ge $NcSeuilRouge)                { [void]$rouge30.Add($k) }
+        if (-not $ok -and $d -lt $NcSeuilRouge)  { [void]$horsReseau.Add($k) }
+        if (-not $minDays.ContainsKey($k) -or $d -lt $minDays[$k]) { $minDays[$k] = $d }
+    }
+
+    # Répartition par ancienneté : postes uniques, dans l'ordre des tranches
+    $parSynchro = @(foreach ($lbl in $NcSyncOrder) { [pscustomobject]@{ Libelle = $lbl; Valeur = 0 } })
+    foreach ($d in $minDays.Values) {
+        if ($d -le $NcSeuilVert)       { $parSynchro[0].Valeur += 1 }
+        elseif ($d -le $NcSeuilOrange) { $parSynchro[1].Valeur += 1 }
+        else                           { $parSynchro[2].Valeur += 1 }
+    }
+
+    return [pscustomobject]@{
+        Occurrences = @($Rows).Count
+        PostesTotal = $all.Count
+        Traitables  = $traitables.Count
+        Vert        = $vert.Count
+        Orange      = $orange.Count
+        Fantomes    = $fantomes.Count
+        Rouge30     = $rouge30.Count
+        HorsReseau  = $horsReseau.Count
+        ParSynchro  = $parSynchro
+    }
+}
+
+# Synthèse par catégorie ET raison : nombre de postes impactés, occurrences,
+# répartition par ancienneté et actionnabilité (repris de Get-ErrorSummary)
+function Get-NcReasonSummary {
+    param([object[]]$Rows, [int]$TotalDevices)
+
+    $acc = [ordered]@{}
+    foreach ($r in $Rows) {
+        $key = "$($r.Category)|$($r.Reason)"
+        if (-not $acc.Contains($key)) {
+            $acc[$key] = [pscustomobject]@{
+                Category = $r.Category; Reason = $r.Reason; Occurrences = 0
+                Devices  = New-NcKeySet; Vert = New-NcKeySet; Orange = New-NcKeySet; Rouge = New-NcKeySet; Actionnables = New-NcKeySet
+            }
+        }
+        $a = $acc[$key]
+        $k = [string]$r.DeviceKey
+        $d = if ($null -eq $r.DaysSinceSync) { [int]::MaxValue } else { [int]$r.DaysSinceSync }
+        $a.Occurrences += 1
+        [void]$a.Devices.Add($k)
+        if ($d -le $NcSeuilVert)       { [void]$a.Vert.Add($k) }
+        elseif ($d -le $NcSeuilOrange) { [void]$a.Orange.Add($k) }
+        else                           { [void]$a.Rouge.Add($k) }
+        if ($r.Action -eq $NcLabelActionnable -and $d -lt $NcSeuilRouge) { [void]$a.Actionnables.Add($k) }
+    }
+
+    $list = foreach ($a in $acc.Values) {
+        [pscustomobject][ordered]@{
+            'Catégorie'                     = $a.Category
+            'Raison'                        = $a.Reason
+            'Postes impactés'               = $a.Devices.Count
+            'Part des postes NC (%)'        = Format-NcPercent $a.Devices.Count $TotalDevices
+            'Occurrences'                   = $a.Occurrences
+            "Synchro $NcLblVert"            = $a.Vert.Count
+            "Synchro $NcLblOrange"          = $a.Orange.Count
+            "Synchro $NcLblRouge"           = $a.Rouge.Count
+            "Actionnables (< $NcSeuilRouge j)" = $a.Actionnables.Count
+            'Intraitables'                  = $a.Devices.Count - $a.Actionnables.Count
+        }
+    }
+    return @($list | Sort-Object @{ Expression = 'Postes impactés'; Descending = $true }, @{ Expression = 'Occurrences'; Descending = $true },
+                                 @{ Expression = 'Catégorie' }, @{ Expression = 'Raison' })
+}
+
+# Synthèse par catégorie : postes impactés, raisons distinctes, principales raisons
+function Get-NcCategorySummary {
+    param([object[]]$Rows, [object[]]$ReasonSummary, [int]$TotalDevices)
+
+    $acc = [ordered]@{}
+    foreach ($r in $Rows) {
+        $c = [string]$r.Category
+        if (-not $acc.Contains($c)) {
+            $acc[$c] = [pscustomobject]@{ Category = $c; Occurrences = 0; Devices = New-NcKeySet; Reasons = New-NcKeySet; Actionnables = New-NcKeySet }
+        }
+        $a = $acc[$c]
+        $k = [string]$r.DeviceKey
+        $d = if ($null -eq $r.DaysSinceSync) { [int]::MaxValue } else { [int]$r.DaysSinceSync }
+        $a.Occurrences += 1
+        [void]$a.Devices.Add($k)
+        [void]$a.Reasons.Add([string]$r.Reason)
+        if ($r.Action -eq $NcLabelActionnable -and $d -lt $NcSeuilRouge) { [void]$a.Actionnables.Add($k) }
+    }
+
+    $list = foreach ($a in $acc.Values) {
+        $top = @($ReasonSummary | Where-Object { $_.'Catégorie' -eq $a.Category } | Select-Object -First 3 |
+                 ForEach-Object { '{0} ({1})' -f $_.'Raison', $_.'Postes impactés' })
+        [pscustomobject][ordered]@{
+            'Catégorie'                        = $a.Category
+            'Postes impactés'                  = $a.Devices.Count
+            'Part des postes NC (%)'           = Format-NcPercent $a.Devices.Count $TotalDevices
+            'Occurrences'                      = $a.Occurrences
+            'Raisons distinctes'               = $a.Reasons.Count
+            "Actionnables (< $NcSeuilRouge j)" = $a.Actionnables.Count
+            'Intraitables'                     = $a.Devices.Count - $a.Actionnables.Count
+            'Principales raisons'              = $top -join ' | '
+        }
+    }
+    return @($list | Sort-Object @{ Expression = 'Postes impactés'; Descending = $true }, @{ Expression = 'Catégorie' })
+}
+
+# Synthèse par poste (reprise de Get-SyncSummary) avec priorité de traitement
+function Get-NcDeviceSummary {
+    param([object[]]$Rows)
+
+    $acc = [ordered]@{}
+    foreach ($r in $Rows) {
+        $k = [string]$r.DeviceKey
+        if (-not $acc.Contains($k)) { $acc[$k] = [System.Collections.Generic.List[object]]::new() }
+        $acc[$k].Add($r)
+    }
+
+    $list = foreach ($k in $acc.Keys) {
+        $g    = $acc[$k]
+        $best = $g[0]
+        foreach ($x in $g) {
+            if ($null -ne $x.DaysSinceSync -and ($null -eq $best.DaysSinceSync -or $x.DaysSinceSync -lt $best.DaysSinceSync)) { $best = $x }
+        }
+        $daysRule   = if ($null -eq $best.DaysSinceSync) { [int]::MaxValue } else { [int]$best.DaysSinceSync }
+        $actionable = @($g | Where-Object { $_.Action -eq $NcLabelActionnable }).Count -gt 0
+        $priority   = if ($daysRule -ge $NcSeuilRouge) { $NcPrioFantome }
+                      elseif (-not $actionable)        { $NcPrioHorsReseau }
+                      elseif ($daysRule -le $NcSeuilVert) { $NcPrioHaute }
+                      else                             { $NcPrioATraiter }
+
+        [pscustomobject][ordered]@{
+            'Priorité'             = $priority
+            'Poste'                = $best.DeviceName
+            'Utilisateur (UPN)'    = $best.UserPrincipalName
+            'OS'                   = $best.OperatingSystem
+            'Dernière synchro'     = Format-NcDate $best.LastSyncUtc
+            'Jours depuis synchro' = $best.DaysSinceSync
+            'Statut synchro'       = $best.SyncStatus
+            'Nb erreurs'           = $g.Count
+            'Catégories'           = (@($g | ForEach-Object { $_.Category } | Sort-Object -Unique) -join ' | ')
+            'Raisons'              = (@($g | ForEach-Object { $_.Reason } | Sort-Object -Unique) -join ' | ')
+        }
+    }
+    return @($list | Sort-Object @{ Expression = 'Priorité' },
+                                 @{ Expression = { if ($null -eq $_.'Jours depuis synchro') { [int]::MaxValue } else { $_.'Jours depuis synchro' } } },
+                                 @{ Expression = 'Poste' })
+}
+
+# Détail "poste x paramètre en écart" (colonnes du tableau et du CSV)
+function Select-NcDetailView {
+    param([object[]]$Rows)
+    foreach ($r in $Rows) {
+        [pscustomobject][ordered]@{
+            'Poste'                = $r.DeviceName
+            'Utilisateur (UPN)'    = $r.UserPrincipalName
+            'OS'                   = $r.OperatingSystem
+            'Catégorie'            = $r.Category
+            'Raison'               = $r.Reason
+            'Paramètre Intune'     = $r.Setting
+            'Stratégie'            = $r.PolicyName
+            'Statut paramètre'     = $r.SettingStatus
+            'État conformité'      = $r.ComplianceState
+            'Dernière synchro'     = Format-NcDate $r.LastSyncUtc
+            'Jours depuis synchro' = $r.DaysSinceSync
+            'Statut synchro'       = $r.SyncStatus
+            'Action possible'      = $r.Action
+        }
+    }
+}
+
+# Indicateurs clés sous forme de tableau (CSV "0_Indicateurs")
+function Get-NcKpiView {
+    param([object]$Result, [string]$ClientName = "")
+    $k   = $Result.Kpi
+    $row = { param($Name, $Value, $Description) [pscustomobject][ordered]@{ 'Indicateur' = $Name; 'Valeur' = $Value; 'Description' = $Description } }
+    & $row 'Client'             $ClientName ''
+    & $row 'Date de référence'  ($Result.ReferenceDate.ToString('dd/MM/yyyy HH:mm', [Globalization.CultureInfo]::InvariantCulture)) "Interrogation de l'API Graph"
+    & $row 'Source des données' $Result.Source ''
+    & $row 'Postes non conformes'                            $k.PostesTotal 'Postes uniques non conformes dans le périmètre analysé'
+    & $row "Postes actionnables (< $NcSeuilRouge j)"         $k.Traitables  'Joignables et corrigeables à distance'
+    & $row "Dont synchro ≤ $NcSeuilVert j"                   $k.Vert        'Synchro très récente : priorité haute'
+    & $row "Dont synchro $($NcSeuilVert + 1)-$NcSeuilOrange j" $k.Orange    'Encore actifs, à traiter rapidement'
+    & $row 'Postes intraitables'                             $k.Fantomes    'Fantômes ou hors réseau : hors de portée'
+    & $row "Dont synchro ≥ $NcSeuilRouge j"                  $k.Rouge30     "Hors ligne depuis au moins $NcSeuilRouge jours"
+    & $row "Dont hors réseau > $NcSeuilHorsReseau j"         $k.HorsReseau  'Erreur réseau / pare-feu / BitLocker sur un poste hors ligne'
+    & $row "Occurrences d'erreur"                            $k.Occurrences 'Un poste peut cumuler plusieurs erreurs'
+}
+
+# Anonymisation cohérente : un même poste / utilisateur garde le même alias
+# sur toutes ses lignes (indispensable aux synthèses par poste)
+function Protect-NcRows {
+    param([object[]]$Rows)
+    $devices = @{}
+    $users   = @{}
+    foreach ($r in $Rows) {
+        if (-not $devices.ContainsKey($r.DeviceKey)) { $devices[$r.DeviceKey] = "Poste-" + ([guid]::NewGuid().ToString().Substring(0, 8)) }
+        $r.DeviceName = $devices[$r.DeviceKey]
+        $u = "$($r.UserPrincipalName)".ToLowerInvariant()
+        if ($u) {
+            if (-not $users.ContainsKey($u)) { $users[$u] = "User-" + ([guid]::NewGuid().ToString().Substring(0, 8)) }
+            $r.UserPrincipalName = $users[$u]
+        }
+    }
+}
+
+# Résultat vide de l'analyse
+function New-NcResult {
+    return [pscustomobject]@{
+        Success         = $false
+        Error           = ""
+        Source          = ""
+        ReferenceDate   = Get-Date
+        Rows            = @()
+        Kpi             = $null
+        CategorySummary = @()
+        ReasonSummary   = @()
+        DeviceSummary   = @()
+        Warnings        = [System.Collections.Generic.List[string]]::new()
+    }
+}
+
+# Point d'entrée de l'analyse. Ne lève jamais d'exception : en cas d'échec,
+# Success = $false et Error contient le message à afficher.
+function Invoke-NonComplianceAnalysis {
+    param([object[]]$ScopeDevices, [string]$AccessToken, [switch]$Anonymize)
+
+    $result = New-NcResult
+    try {
+        $nonCompliant = @($ScopeDevices | Where-Object { "$($_.ComplianceState)" -eq 'noncompliant' })
+        $raw          = [System.Collections.Generic.List[object]]::new()
+
+        if ($nonCompliant.Count -gt 0) {
+            # --- Source 1 : rapport Intune (tout le tenant en quelques appels) ---
+            $haveData = $false
+            if ($NcUseBulkReport) {
+                try {
+                    Set-UiStatus "🧩 Non-conformités : lecture du rapport Intune (API Graph)..."
+                    $report = Get-NcRowsFromReport -Devices $nonCompliant -AccessToken $AccessToken
+                    if ($report.Rows.Count -gt 0) {
+                        foreach ($r in $report.Rows) { $raw.Add($r) }
+                        $haveData      = $true
+                        $result.Source = $NcSourceReport
+                    } else {
+                        $result.Warnings.Add("Le rapport Intune n'a renvoyé aucun paramètre en écart pour les $($nonCompliant.Count) poste(s) non conforme(s) du périmètre : analyse appareil par appareil.")
+                    }
+                } catch {
+                    $result.Warnings.Add("Rapport Intune « Noncompliant devices and settings » indisponible, analyse appareil par appareil. Détail : $($_.Exception.Message)")
+                }
+            }
+
+            # --- Source 2 : repli appareil par appareil ---
+            if (-not $haveData) {
+                foreach ($r in @(Get-NcRowsPerDevice -Devices $nonCompliant -AccessToken $AccessToken -Warnings $result.Warnings)) { $raw.Add($r) }
+                $result.Source = $NcSourcePerDevice
+            }
+
+            # --- Postes non conformes sans raison remontée : conservés, pour que le
+            #     total corresponde au graphique "Compliance Status" ---
+            $withRows = New-NcKeySet
+            foreach ($r in $raw) { [void]$withRows.Add($r.DeviceKey) }
+            foreach ($d in $nonCompliant) {
+                if (-not $withRows.Contains("$($d.Id)")) { $raw.Add((New-NcRawRow -Device $d -Reason $NcReasonNotReported -Category $NcCategoryUnknown)) }
+            }
+
+            if ($Anonymize) { Protect-NcRows -Rows $raw }
+        }
+
+        Set-UiStatus "🧮 Non-conformités : classement par catégorie et par raison..."
+        $rows                   = @(Invoke-NcDataProcessing -Rows $raw -NowUtc $result.ReferenceDate.ToUniversalTime())
+        $result.Rows            = $rows
+        $result.Kpi             = Get-NcKpi -Rows $rows
+        $result.ReasonSummary   = @(Get-NcReasonSummary -Rows $rows -TotalDevices $result.Kpi.PostesTotal)
+        $result.CategorySummary = @(Get-NcCategorySummary -Rows $rows -ReasonSummary $result.ReasonSummary -TotalDevices $result.Kpi.PostesTotal)
+        $result.DeviceSummary   = @(Get-NcDeviceSummary -Rows $rows)
+        $result.Success         = $true
+    } catch {
+        $result.Success = $false
+        $result.Error   = $_.Exception.Message
+    }
+    return $result
+}
+
+# Export CSV des synthèses (séparateur $NcCsvDelimiter, UTF-8 avec BOM pour Excel).
+# Chaque fichier est écrit indépendamment : un échec (fichier ouvert dans Excel,
+# droits...) est ajouté aux avertissements sans bloquer les autres.
+function Export-NcCsvReports {
+    param([object]$Result, [string]$Folder, [string]$ClientName = "")
+
+    $written = [System.Collections.Generic.List[string]]::new()
+    try {
+        if (-not (Test-Path -LiteralPath $Folder)) { New-Item -ItemType Directory -Path $Folder -Force -ErrorAction Stop | Out-Null }
+    } catch {
+        $Result.Warnings.Add("Export CSV impossible : le dossier « $Folder » n'a pas pu être créé ($($_.Exception.Message)).")
+        return @()
+    }
+
+    $files = [ordered]@{
+        '0_Indicateurs.csv'            = @(Get-NcKpiView -Result $Result -ClientName $ClientName)
+        '1_Synthese_Categories.csv'    = @($Result.CategorySummary)
+        '2_Synthese_Raisons.csv'       = @($Result.ReasonSummary)
+        '3_Synthese_Postes.csv'        = @($Result.DeviceSummary)
+        '4_Detail_Non_Conformites.csv' = @(Select-NcDetailView -Rows $Result.Rows)
+    }
+    $utf8Bom = [System.Text.UTF8Encoding]::new($true)
+    foreach ($name in @($files.Keys)) {
+        $path = Join-Path $Folder $name
+        try {
+            $lines = [string[]]@($files[$name] | ConvertTo-Csv -NoTypeInformation -Delimiter $NcCsvDelimiter)
+            [System.IO.File]::WriteAllLines($path, $lines, $utf8Bom)
+            $written.Add($path)
+        } catch {
+            $Result.Warnings.Add("Export CSV « $name » en échec : $($_.Exception.Message)")
+        }
+    }
+    return $written.ToArray()
+}
+
+# Bloc d'en-tête de la section "Non-Compliance Analysis" : KPI, règle de lecture,
+# source et exports, avertissements. Rendu uniquement (données déjà calculées).
+function New-NcDashboardHeadHtml {
+    param([object]$Result, [int]$TotalDevices, [string]$CsvFolder = "", [string[]]$CsvFiles = @())
+
+    # Échappement HTML + crochets (évite l'interprétation [texte](lien) par PSWriteHTML)
+    $esc = { param($Text) ((ConvertTo-HtmlSafe $Text) -replace '\[', '&#91;') -replace '\]', '&#93;' }
+
+    $warnHtml = ""
+    if ($Result.Warnings.Count -gt 0) {
+        $items    = ($Result.Warnings | ForEach-Object { "<li>$(& $esc $_)</li>" }) -join ''
+        $warnHtml = "<div class=`"ix-root ix-note ix-note--warn`">$(Get-IconSvg -Name 'alert' -Size 18)<div><strong>Avertissements de l'analyse</strong><ul>$items</ul></div></div>"
+    }
+
+    if (-not $Result.Success) {
+        $detail = & $esc $Result.Error
+        return (New-IxEmptyState -Icon 'alert' -Tone 'danger' -Title "Analyse des non-conformités indisponible" `
+                    -Text "L'API Graph n'a pas pu fournir les données de non-conformité ; le reste du dashboard n'est pas affecté.<br><br><b>Détail :</b> $detail") + $warnHtml
+    }
+
+    $meta = [System.Collections.Generic.List[string]]::new()
+    if ($Result.Source) { $meta.Add("<span class=`"ix-meta__item`">$(Get-IconSvg -Name 'database' -Size 14)Source : $(& $esc $Result.Source)</span>") }
+    $meta.Add("<span class=`"ix-meta__item`">$(Get-IconSvg -Name 'calendar' -Size 14)Référence : $($Result.ReferenceDate.ToString("dd/MM/yyyy 'à' HH:mm"))</span>")
+    if ($CsvFiles.Count -gt 0) {
+        $meta.Add("<span class=`"ix-meta__item`">$(Get-IconSvg -Name 'file-text' -Size 14)$($CsvFiles.Count) synthèses CSV : $(& $esc $CsvFolder)</span>")
+    }
+    $metaHtml = "<div class=`"ix-root ix-meta`">$($meta -join '')</div>"
+
+    $k = $Result.Kpi
+    if ($k.PostesTotal -eq 0) {
+        return (New-IxEmptyState -Icon 'shield-ok' -Tone 'success' -Title 'Aucun poste non conforme' `
+                    -Text "Aucun appareil du périmètre analysé n'est à l'état « non conforme » dans Intune.") + $metaHtml + $warnHtml
+    }
+
+    $cards = [System.Text.StringBuilder]::new()
+    [void]$cards.Append((New-IxStatCard -Label 'Postes non conformes' -Value $k.PostesTotal -Icon 'alert' -Color $Colors.Compliance -Caption "<b>$(Get-IxPercent $k.PostesTotal $TotalDevices) %</b> du parc analysé"))
+    [void]$cards.Append((New-IxStatCard -Label "Actionnables (&lt; $NcSeuilRouge j)" -Value $k.Traitables -Icon 'tool' -Color $Colors.Accent -Caption 'Joignables et corrigeables à distance'))
+    [void]$cards.Append((New-IxStatCard -Label "Dont synchro &le; $NcSeuilVert j" -Value $k.Vert -Icon 'zap' -Color $Colors.Success -Caption 'Synchro très récente : priorité haute'))
+    [void]$cards.Append((New-IxStatCard -Label "Dont synchro $($NcSeuilVert + 1)-$NcSeuilOrange j" -Value $k.Orange -Icon 'clock' -Color $Colors.Secondary -Caption 'Encore actifs, à traiter rapidement'))
+    [void]$cards.Append((New-IxStatCard -Label 'Intraitables' -Value $k.Fantomes -Icon 'x-circle' -Color $Colors.Danger -Caption 'Fantômes ou hors réseau : hors de portée'))
+    [void]$cards.Append((New-IxStatCard -Label "Dont synchro &ge; $NcSeuilRouge j" -Value $k.Rouge30 -Icon 'eye-off' -Color '#ea580c' -Caption "Hors ligne depuis au moins $NcSeuilRouge jours"))
+    [void]$cards.Append((New-IxStatCard -Label "Dont hors réseau &gt; $NcSeuilHorsReseau j" -Value $k.HorsReseau -Icon 'wifi-off' -Color $Colors.Warning -Caption 'Erreur réseau / pare-feu / BitLocker'))
+    [void]$cards.Append((New-IxStatCard -Label "Occurrences d'erreur" -Value $k.Occurrences -Icon 'list' -Color $Colors.Primary -Caption 'Un poste peut cumuler plusieurs erreurs'))
+
+    $note = "<div class=`"ix-root ix-note`">$(Get-IconSvg -Name 'info' -Size 18)<div><strong>Règle de lecture :</strong> " +
+            "une erreur réseau, pare-feu, BitLocker ou d'inactivité ne peut être ni corrigée ni vérifiée tant que le poste ne s'est pas reconnecté. " +
+            "Un poste hors ligne depuis plus de $NcSeuilHorsReseau jours porteur de ce type d'erreur est donc classé « $NcLabelImpossible ». " +
+            "Les postes synchronisés depuis moins de $NcSeuilRouge jours sont traitables, en priorité ceux de $NcSeuilVert jours ou moins.</div></div>"
+
+    return "<div class=`"ix-root ix-overview`">$($cards.ToString())</div>" + $note + $metaHtml + $warnHtml
 }
 
 # ========================================
@@ -1105,11 +2216,18 @@ function Generate-Dashboard {
 
         # ===== CONNEXION GRAPH =====
         $lblStatus.Text = "🔐 Connexion à Microsoft Graph..."; $form.Refresh()
-        $Scope   = "https://graph.microsoft.com/.default"
-        $AuthUrl = "https://login.microsoftonline.com/$TenantId/oauth2/v2.0/token"
-        $Body    = @{ client_id = $ClientId; scope = $Scope; client_secret = $ClientSecret; grant_type = "client_credentials" }
-        $Connection  = Invoke-RestMethod -Method POST -Uri $AuthUrl -Body $Body -ContentType "application/x-www-form-urlencoded" -ErrorAction Stop
-        $AccessToken = $Connection.access_token
+        # [v3.3] Jeton géré par Get-GraphAccessToken : erreur d'authentification explicite
+        # (secret expiré, tenant inconnu, réseau) et renouvellement automatique avant
+        # expiration pendant les analyses longues. Cache par appareil remis à zéro.
+        $script:GraphAuth       = @{ TenantId = $TenantId; ClientId = $ClientId; ClientSecret = $ClientSecret; AccessToken = $null; ExpiresAtUtc = [datetime]::MinValue }
+        $script:NcSettingsCache = @{}
+        try {
+            $AccessToken = Get-GraphAccessToken -ForceRefresh
+        } catch {
+            $lblStatus.Text = "❌ Échec de l'authentification Microsoft Graph"; $lblStatus.ForeColor = [System.Drawing.Color]::Red
+            Show-ErrorMessage "Impossible d'obtenir un jeton d'accès Microsoft Graph pour $ClientName :`n`n$($_.Exception.Message)"
+            return
+        }
         $SecureToken = ConvertTo-SecureString -String $AccessToken -AsPlainText -Force
         Connect-MgGraph -AccessToken $SecureToken -NoWelcome
 
@@ -1164,6 +2282,16 @@ function Generate-Dashboard {
             $lblStatus.Text = "✓ Analyse de la conformité..."; $form.Refresh()
             $CompliantDevices    = @($DevicesScope | Where-Object ComplianceState -EQ "compliant")
             $NoncompliantDevices = @($DevicesScope | Where-Object ComplianceState -EQ "noncompliant")
+        }
+
+        # ===== [v3.3] ANALYSE DES NON-CONFORMITÉS PAR CATÉGORIE / RAISON (API GRAPH) =====
+        # Placée avant le chiffrement : en mode "par appareil", les postes déjà analysés
+        # sont réutilisés (cache) pour la colonne RootCause de "Non Encrypted".
+        # L'analyse gère ses propres erreurs : un échec n'interrompt pas le dashboard.
+        $NcResult = $null
+        if ($chkNcAnalysis.Checked) {
+            $lblStatus.Text = "🧩 Analyse des raisons de non-conformité (API Graph)..."; $form.Refresh()
+            $NcResult = Invoke-NonComplianceAnalysis -ScopeDevices $DevicesScope -AccessToken $AccessToken -Anonymize:$AnonymizeData
         }
 
         # ===== APPAREILS INACTIFS (paliers dynamiques) =====
@@ -1287,6 +2415,20 @@ function Generate-Dashboard {
             $Model      = $WindowsDevices | Group-Object { "$($_.Manufacturer), $($_.Model)" } | Sort-Object Count -Descending | Select-Object Name, Count -First 10
         }
 
+        # ===== [v3.3] JETON APRÈS LES ANALYSES LONGUES =====
+        # Les analyses par appareil (non-conformités, Non Encrypted) peuvent dépasser la
+        # durée de vie du jeton (~1 h) : il est renouvelé si besoin pour les appels suivants
+        # (rapport d'échecs d'applications, SDK Graph des Update Rings).
+        try {
+            $FreshToken = Get-GraphAccessToken
+            if ($FreshToken -and $FreshToken -ne $AccessToken) {
+                $AccessToken = $FreshToken
+                Connect-MgGraph -AccessToken (ConvertTo-SecureString -String $AccessToken -AsPlainText -Force) -NoWelcome
+            }
+        } catch {
+            Write-Host "[Graph] Renouvellement du jeton impossible, poursuite avec le jeton courant : $($_.Exception.Message)" -ForegroundColor DarkYellow
+        }
+
         # ===== ÉCHECS APPS =====
         if ($chkApplications.Checked) {
             $lblStatus.Text = "📱 Analyse des échecs d'installation..."; $form.Refresh()
@@ -1380,6 +2522,17 @@ function Generate-Dashboard {
         $Timestamp        = (Get-Date).ToString("yyyy-MM-dd_HHmmss")
         $AnonymizedSuffix = if ($AnonymizeData) { "_ANONYMIZED" } else { "" }
         $ReportFileName   = "Intune-Dashboard_${ClientName}${AnonymizedSuffix}_${Timestamp}.html"
+
+        # ===== [v3.3] EXPORT CSV DES SYNTHÈSES DE NON-CONFORMITÉ =====
+        # Un sous-dossier par génération, à côté du rapport HTML
+        $NcCsvFiles  = @()
+        $NcCsvFolder = ""
+        if ($chkNcAnalysis.Checked -and $chkNcCsv.Checked -and $NcResult -and $NcResult.Success -and $NcResult.Kpi.PostesTotal -gt 0) {
+            $lblStatus.Text = "📄 Export CSV des synthèses de non-conformité..."; $form.Refresh()
+            $SafeFileClient = $ClientName -replace '[\\/:*?"<>|]', '_'
+            $NcCsvFolder    = Join-Path $OutputFolder "Intune-NonCompliance_${SafeFileClient}${AnonymizedSuffix}_${Timestamp}"
+            $NcCsvFiles     = @(Export-NcCsvReports -Result $NcResult -Folder $NcCsvFolder -ClientName $ClientName)
+        }
 
         # ===== [MODIF v3] COMPTEURS "NON ENCRYPTED" POUR LE FILTRE DU DASHBOARD =====
         # Calculés côté PowerShell puis injectés dans le JavaScript du dashboard :
@@ -1534,18 +2687,25 @@ $ContactHtml
             $RingsHtml = "<div class=`"ix-root ix-rings`">$($rb.ToString())</div>"
         }
 
+        # --- [v3.3] Analyse des non-conformités : KPI, règle de lecture, source, avertissements ---
+        $NcHeadHtml = ""
+        if ($chkNcAnalysis.Checked -and $NcResult) {
+            $NcHeadHtml = New-NcDashboardHeadHtml -Result $NcResult -TotalDevices $TotalDevices -CsvFolder $NcCsvFolder -CsvFiles $NcCsvFiles
+        }
+        $NcHasData = $chkNcAnalysis.Checked -and $NcResult -and $NcResult.Success -and $NcResult.Kpi.PostesTotal -gt 0
+
         # ============================================================
         # [UI v3.2] PAGES VIRTUELLES
         # Une page n'est créée (et son onglet affiché) que si au moins une
         # des sections qu'elle regroupe est cochée dans l'interface.
         # ============================================================
-        $HasSecurity = $chkCompliance.Checked -or $chkEncryption.Checked
+        $HasSecurity = $chkCompliance.Checked -or $chkEncryption.Checked -or $chkNcAnalysis.Checked
         $HasDeploy   = $chkUpdateRings.Checked -or $chkApplications.Checked
         $HasOptim    = ($InactiveThresholds.Count -gt 0) -or $ShowLowStorage
 
         $IxPages = [System.Collections.Generic.List[object]]::new()
         $IxPages.Add([PSCustomObject]@{ Id = 'vue-ensemble'; Icon = 'layout'; Label = "Vue d'ensemble"; Hint = 'Taille et composition du parc : plateformes, modèles et versions de Windows' })
-        if ($HasSecurity) { $IxPages.Add([PSCustomObject]@{ Id = 'securite';     Icon = 'shield';  Label = 'Sécurité & conformité';       Hint = 'Conformité Intune et chiffrement BitLocker des appareils' }) }
+        if ($HasSecurity) { $IxPages.Add([PSCustomObject]@{ Id = 'securite';     Icon = 'shield';  Label = 'Sécurité & conformité';       Hint = 'Conformité Intune, raisons de non-conformité et chiffrement BitLocker' }) }
         if ($HasDeploy)   { $IxPages.Add([PSCustomObject]@{ Id = 'deploiement';  Icon = 'package'; Label = 'Mises à jour & applications'; Hint = 'Windows Update Rings et déploiement des applications' }) }
         if ($HasOptim)    { $IxPages.Add([PSCustomObject]@{ Id = 'optimisation'; Icon = 'gauge';   Label = 'Optimisation du parc';        Hint = 'Appareils inactifs et espace disque disponible' }) }
 
@@ -1607,22 +2767,72 @@ $ContactHtml
             if ($HasSecurity) {
                 Get-IxPageStart -Page $IxPage['securite']
 
-                New-HTMLSection -Height 350 -HeaderText "Security & Compliance" -HeaderTextSize 14 -HeaderBackGroundColor $Colors.Compliance -CanCollapse {
-                    if ($chkCompliance.Checked) {
-                        New-HTMLPanel {
-                            New-HTMLChart -Gradient {
-                                New-ChartDonut -Name "Compliant"     -Value $CompliantDevices.Count    -Color $Colors.Success
-                                New-ChartDonut -Name "Non-Compliant" -Value $NoncompliantDevices.Count -Color $Colors.Danger
-                            } -Title "Compliance Status" -TitleAlignment center -TitleColor $Colors.Primary
+                # [v3.3] Section affichée seulement si l'un de ses deux graphiques est demandé
+                # (la page peut désormais n'exister que pour l'analyse des non-conformités)
+                if ($chkCompliance.Checked -or $chkEncryption.Checked) {
+                    New-HTMLSection -Height 350 -HeaderText "Security & Compliance" -HeaderTextSize 14 -HeaderBackGroundColor $Colors.Compliance -CanCollapse {
+                        if ($chkCompliance.Checked) {
+                            New-HTMLPanel {
+                                New-HTMLChart -Gradient {
+                                    New-ChartDonut -Name "Compliant"     -Value $CompliantDevices.Count    -Color $Colors.Success
+                                    New-ChartDonut -Name "Non-Compliant" -Value $NoncompliantDevices.Count -Color $Colors.Danger
+                                } -Title "Compliance Status" -TitleAlignment center -TitleColor $Colors.Primary
+                            }
+                        }
+                        if ($chkEncryption.Checked) {
+                            New-HTMLPanel {
+                                New-HTMLChart -Gradient {
+                                    New-ChartDonut -Name "Encrypted (BitLocker)" -Value $EncryptedDevices.Count  -Color $Colors.Success
+                                    New-ChartDonut -Name "Not Encrypted"         -Value $UnecryptedDevices.Count -Color $Colors.Danger
+                                } -Title "BitLocker Status" -TitleAlignment center -TitleColor $Colors.Primary
+                            }
                         }
                     }
-                    if ($chkEncryption.Checked) {
+                }
+
+                # [v3.3] ANALYSE DES NON-CONFORMITÉS : KPI, graphiques et synthèses par catégorie / raison
+                if ($chkNcAnalysis.Checked -and $NcResult) {
+                    New-HTMLSection -HeaderText "Non-Compliance Analysis" -HeaderTextSize 14 -HeaderBackGroundColor $Colors.Compliance -CanCollapse {
+                        New-HTMLPanel {
+                            New-HTMLText -Text $NcHeadHtml -FontSize 1
+                        }
+                    }
+                }
+
+                if ($NcHasData) {
+                    New-HTMLSection -Height 380 -HeaderText "Non-Compliance by Category & Reason" -HeaderTextSize 14 -HeaderBackGroundColor $Colors.Compliance -CanCollapse {
                         New-HTMLPanel {
                             New-HTMLChart -Gradient {
-                                New-ChartDonut -Name "Encrypted (BitLocker)" -Value $EncryptedDevices.Count  -Color $Colors.Success
-                                New-ChartDonut -Name "Not Encrypted"         -Value $UnecryptedDevices.Count -Color $Colors.Danger
-                            } -Title "BitLocker Status" -TitleAlignment center -TitleColor $Colors.Primary
+                                foreach ($ncCat in $NcResult.CategorySummary) { New-ChartBar -Name $ncCat.'Catégorie' -Value $ncCat.'Postes impactés' }
+                                New-ChartLegend -Name "Postes impactés"
+                            } -Title "Postes impactés par catégorie" -TitleAlignment center -TitleColor $Colors.Primary
                         }
+                        New-HTMLPanel {
+                            New-HTMLChart -Gradient {
+                                foreach ($ncReason in ($NcResult.ReasonSummary | Select-Object -First 10)) { New-ChartBar -Name $ncReason.'Raison' -Value $ncReason.'Postes impactés' }
+                                New-ChartLegend -Name "Postes impactés"
+                            } -Title "Top 10 des raisons de non-conformité" -TitleAlignment center -TitleColor $Colors.Primary
+                        }
+                        New-HTMLPanel {
+                            New-HTMLChart -Gradient {
+                                New-ChartDonut -Name $NcResult.Kpi.ParSynchro[0].Libelle -Value $NcResult.Kpi.ParSynchro[0].Valeur -Color $Colors.Success
+                                New-ChartDonut -Name $NcResult.Kpi.ParSynchro[1].Libelle -Value $NcResult.Kpi.ParSynchro[1].Valeur -Color $Colors.Warning
+                                New-ChartDonut -Name $NcResult.Kpi.ParSynchro[2].Libelle -Value $NcResult.Kpi.ParSynchro[2].Valeur -Color $Colors.Danger
+                            } -Title "Ancienneté de la dernière synchronisation" -TitleAlignment center -TitleColor $Colors.Primary
+                        }
+                    }
+
+                    New-HTMLSection -HeaderText "Non-Compliance Summary by Category" -HeaderTextSize 14 -HeaderBackGroundColor $Colors.DetailTables -CanCollapse {
+                        New-HTMLTable -DataTable $NcResult.CategorySummary -Filtering -PagingLength 25
+                    }
+                    New-HTMLSection -HeaderText "Non-Compliance Summary by Reason" -HeaderTextSize 14 -HeaderBackGroundColor $Colors.DetailTables -CanCollapse {
+                        New-HTMLTable -DataTable $NcResult.ReasonSummary -Filtering -PagingLength 25
+                    }
+                    New-HTMLSection -HeaderText "Non-Compliant Devices - Triage by Priority" -HeaderTextSize 14 -HeaderBackGroundColor $Colors.DetailTables -CanCollapse -Collapsed {
+                        New-HTMLTable -DataTable $NcResult.DeviceSummary -Filtering -PagingLength 50
+                    }
+                    New-HTMLSection -HeaderText "Non-Compliance Detail (Device x Setting)" -HeaderTextSize 14 -HeaderBackGroundColor $Colors.DetailTables -CanCollapse -Collapsed {
+                        New-HTMLTable -DataTable @(Select-NcDetailView -Rows $NcResult.Rows) -Filtering -PagingLength 50
                     }
                 }
 
@@ -1836,11 +3046,26 @@ $ContactHtml
         $message = "Dashboard généré avec succès !`n`nFichier : $OutputFolder\$ReportFileName"
         if ($OpenAfterGeneration) { $message += "`n`nLe rapport s'ouvre automatiquement dans votre navigateur." }
         else                      { $message += "`n`nLe rapport est disponible dans le dossier de sortie." }
+
+        # [v3.3] Bilan de l'analyse des non-conformités (exports CSV, erreurs API)
+        if ($NcCsvFiles.Count -gt 0) {
+            $message += "`n`nSynthèses CSV des non-conformités ($($NcCsvFiles.Count) fichiers) :`n$NcCsvFolder"
+        }
+        if ($NcResult -and -not $NcResult.Success) {
+            $lblStatus.Text = "⚠ Dashboard généré - analyse des non-conformités indisponible"; $lblStatus.ForeColor = [System.Drawing.Color]::DarkOrange
+            $message += "`n`n⚠ Analyse des non-conformités indisponible :`n$($NcResult.Error)"
+        } elseif ($NcResult -and $NcResult.Warnings.Count -gt 0) {
+            $message += "`n`n⚠ $($NcResult.Warnings.Count) avertissement(s) sur l'analyse des non-conformités (détail dans le dashboard) :`n- " + ($NcResult.Warnings -join "`n- ")
+        }
         Show-InfoMessage $message
 
     } catch {
         $lblStatus.Text = "❌ Erreur lors de la génération"; $lblStatus.ForeColor = [System.Drawing.Color]::Red
         Show-ErrorMessage "Erreur lors de la génération du dashboard :`n`n$($_.Exception.Message)"
+    } finally {
+        # [v3.3] Le secret client et le cache d'analyse ne survivent pas à la génération
+        $script:GraphAuth       = $null
+        $script:NcSettingsCache = $null
     }
 }
 
@@ -1849,7 +3074,7 @@ $ContactHtml
 # ========================================
 
 $form = New-Object System.Windows.Forms.Form
-$form.Text            = "Intune Dashboard v3.2"
+$form.Text            = "Intune Dashboard v3.3"
 $form.Size            = New-Object System.Drawing.Size(980, 700)
 $form.StartPosition   = "CenterScreen"
 $form.FormBorderStyle = "FixedDialog"
@@ -1878,7 +3103,7 @@ $form.Controls.Add($headerPanel)
 $lblTitle           = New-Object System.Windows.Forms.Label
 $lblTitle.Location  = New-Object System.Drawing.Point(30, 20)
 $lblTitle.Size      = New-Object System.Drawing.Size(900, 50)
-$lblTitle.Text      = "Intune Dashboard  —  v3.2"
+$lblTitle.Text      = "Intune Dashboard  —  v3.3"
 $lblTitle.Font      = New-Object System.Drawing.Font("Segoe UI", 18, [System.Drawing.FontStyle]::Bold)
 $lblTitle.ForeColor = [System.Drawing.Color]::White
 $lblTitle.BackColor = [System.Drawing.Color]::Transparent
@@ -2087,7 +3312,7 @@ $btnSelectAll.Cursor    = [System.Windows.Forms.Cursors]::Hand
 $btnSelectAll.Add_Click({
     $chkCompliance.Checked   = $true; $chkEncryption.Checked  = $true
     $chkApplications.Checked = $true; $chkUpdateRings.Checked = $true
-    $chkHardware.Checked     = $true
+    $chkHardware.Checked     = $true; $chkNcAnalysis.Checked  = $true
 })
 $tabContent.Controls.Add($btnSelectAll)
 
@@ -2103,9 +3328,38 @@ $btnDeselectAll.Cursor    = [System.Windows.Forms.Cursors]::Hand
 $btnDeselectAll.Add_Click({
     $chkCompliance.Checked   = $false; $chkEncryption.Checked  = $false
     $chkApplications.Checked = $false; $chkUpdateRings.Checked = $false
-    $chkHardware.Checked     = $false
+    $chkHardware.Checked     = $false; $chkNcAnalysis.Checked  = $false
 })
 $tabContent.Controls.Add($btnDeselectAll)
+
+# [v3.3] Analyse des non-conformités (page "Sécurité & conformité")
+$grpNonCompliance          = New-Object System.Windows.Forms.GroupBox
+$grpNonCompliance.Location = New-Object System.Drawing.Point(30, 300)
+$grpNonCompliance.Size     = New-Object System.Drawing.Size(880, 125)
+$grpNonCompliance.Text     = " Sécurité & conformité — analyse des non-conformités (API Graph) "
+$grpNonCompliance.Font     = New-Object System.Drawing.Font("Segoe UI", 10, [System.Drawing.FontStyle]::Bold)
+$tabContent.Controls.Add($grpNonCompliance)
+
+$chkNcAnalysis          = New-Object System.Windows.Forms.CheckBox
+$chkNcAnalysis.Location = New-Object System.Drawing.Point(20, 28); $chkNcAnalysis.Size = New-Object System.Drawing.Size(840, 25)
+$chkNcAnalysis.Text     = "🔎  Analyser les raisons de non-conformité (catégories, raisons, ancienneté de synchro, actionnabilité)"; $chkNcAnalysis.Checked = $true
+$chkNcAnalysis.Font     = New-Object System.Drawing.Font("Segoe UI", 9)
+$grpNonCompliance.Controls.Add($chkNcAnalysis)
+
+$chkNcCsv          = New-Object System.Windows.Forms.CheckBox
+$chkNcCsv.Location = New-Object System.Drawing.Point(20, 58); $chkNcCsv.Size = New-Object System.Drawing.Size(840, 25)
+$chkNcCsv.Text     = "📄  Exporter les synthèses au format CSV (sous-dossier horodaté dans $OutputFolder)"; $chkNcCsv.Checked = $true
+$chkNcCsv.Font     = New-Object System.Drawing.Font("Segoe UI", 9)
+$grpNonCompliance.Controls.Add($chkNcCsv)
+$chkNcAnalysis.Add_CheckedChanged({ $chkNcCsv.Enabled = $chkNcAnalysis.Checked })
+
+$lblNcInfo           = New-Object System.Windows.Forms.Label
+$lblNcInfo.Location  = New-Object System.Drawing.Point(20, 88)
+$lblNcInfo.Size      = New-Object System.Drawing.Size(840, 30)
+$lblNcInfo.Text      = "Données lues en direct (rapport Intune « Noncompliant devices and settings », repli par appareil). Permissions Graph (Application) : DeviceManagementManagedDevices.Read.All, DeviceManagementConfiguration.Read.All."
+$lblNcInfo.Font      = New-Object System.Drawing.Font("Segoe UI", 8, [System.Drawing.FontStyle]::Italic)
+$lblNcInfo.ForeColor = [System.Drawing.Color]::Gray
+$grpNonCompliance.Controls.Add($lblNcInfo)
 
 # ========================================
 # ONGLET 4 : AFFICHAGE (NOUVEAU)
