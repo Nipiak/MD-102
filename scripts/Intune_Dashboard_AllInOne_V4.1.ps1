@@ -1,10 +1,11 @@
 ﻿# ============================================================
-# Script : Intune Dashboard All-In-One - v4.0
+# Script : Intune Dashboard All-In-One - v4.1
 #          (socle "Script_Global_V3.3_Pages" + module "Proactivité / Santé des postes")
 # Description : Interroge Microsoft Graph (REST, sans module Microsoft.Graph) et
 #               génère, au choix, un dashboard HTML interactif (PSWriteHTML, pages
 #               à onglets collants) et/ou des exports CSV : conformité, chiffrement,
-#               applications, update rings, hardware, santé et proactivité des postes
+#               applications et leurs mises à jour, update rings, hardware, santé et
+#               proactivité des postes
 #
 # REPÈRES DE FUSION (rechercher ces balises dans le fichier) :
 #   [FUSION v4 - Proactivité] : logique reprise du script "Script_proactivité_V2"
@@ -13,6 +14,8 @@
 #                               jour, fiabilité applicative, profils, conformité)
 #   [v4.0]                    : nouveau code propre à la fusion (REST, throttling
 #                               partagé, $batch, HTML basculable, exports CSV...)
+#   [v4.1]                    : mises à jour des applications (inventaire du parc,
+#                               dernières versions des éditeurs lues sur Internet)
 #   [v3.x] / [MODIF v3] / [UI v3.x] : historique du socle V3.3, conservé
 # Nouveautés v2 : options plateformes, paliers inactifs configurables,
 #                 affichage Low Storage au choix
@@ -61,6 +64,18 @@
 #                     tous les flux en pause), Retry-After respecté, $batch pour
 #                     les appels par appareil, fenêtre réactive pendant les pauses
 #                   - journal C:\temp\dashboard-log.txt, pseudonymes stables
+# Nouveautés v4.1 : partie "Mises à jour des applications" (page "Mises à jour &
+#                   applications", onglet "Applications" de la fenêtre) :
+#                   - état du parc applicatif : inventaire Intune des applications
+#                     découvertes (versions présentes, nombre de postes par version)
+#                   - dernières versions publiées lues sur Internet auprès des
+#                     sources officielles (API Google et Microsoft, sites éditeurs,
+#                     GitHub), winget en secours, cache local de 12 h
+#                   - par application suivie : postes à jour / en retard mineur /
+#                     en retard de version majeure, liste des postes à mettre à jour
+#                   - packages Intune Win32 / MSI plus anciens que la version éditeur
+#                   - catalogue des applications suivies modifiable ($AppUpdateCatalog),
+#                     5 nouveaux exports CSV (16 à 20)
 # Auteur : ECONOCOM
 # ============================================================
 
@@ -74,6 +89,9 @@ Add-Type -AssemblyName System.Drawing
 try { [System.Net.ServicePointManager]::DefaultConnectionLimit = 24 } catch { }
 # TLS 1.2 ajouté sans retirer ce qui est déjà négociable (TLS 1.3 sur les OS récents).
 try { [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor [System.Net.SecurityProtocolType]::Tls12 } catch { }
+# [v4.1] Proxy d'entreprise authentifié : le proxy système reçoit les identifiants Windows
+# de la session (recherche des dernières versions d'applications sur les sites éditeurs).
+try { if ([System.Net.WebRequest]::DefaultWebProxy) { [System.Net.WebRequest]::DefaultWebProxy.Credentials = [System.Net.CredentialCache]::DefaultNetworkCredentials } } catch { }
 
 # ===== CONFIGURATION GLOBALE =====
 $ConfigFolder = "C:\temp\clients-id"
@@ -154,6 +172,69 @@ $RemediationThresholds = @{
     ConfigErrorsCritical = 3      # profils de configuration en échec rendant l'alerte critique
 }
 
+# ===== [v4.1] MISES À JOUR DES APPLICATIONS (PAGE "MISES À JOUR & APPLICATIONS") =====
+# Versions INSTALLÉES : inventaire Intune « Applications découvertes » (API Graph).
+# DERNIÈRES versions  : lues sur Internet, auprès des sources officielles des éditeurs.
+# Seules les applications de ce catalogue sont comparées (cochables dans l'onglet
+# « Applications » de la fenêtre) ; l'inventaire, lui, couvre toutes les applications.
+#
+# AJOUTER UNE APPLICATION = ajouter une ligne @{ ... } :
+#   Name         libellé affiché (unique)
+#   Match        expression régulière sur le NOM de l'application découverte, tel
+#                qu'Intune l'affiche (Applications > Surveiller > Applications découvertes)
+#   Source       où lire la dernière version publiée :
+#                  'Url'    : page ou API de l'éditeur : Url + Regex (la plus haute des
+#                             versions capturées par le 1er groupe est retenue)
+#                  'GitHub' : dernière release publiée du dépôt Repo = "propriétaire/dépôt"
+#                             (TagRegex facultatif pour extraire la version de l'étiquette)
+#                  'Winget' : catalogue winget (WingetId) via l'outil winget du poste
+#                  'Chrome', 'Edge' : API officielles de Google et de Microsoft
+#   WingetId     (facultatif) identifiant winget : source de SECOURS si la première échoue
+#   PackageMatch (facultatif) expression régulière sur le nom des applications Win32 / MSI
+#                publiées dans Intune, pour signaler un package en retard (défaut : Name)
+# Les versions sont comparées numériquement, segment par segment ("24.08" = "24.08.00.0").
+$AppUpdateCatalog = @(
+    @{ Name = "Google Chrome";         Match = '^Google Chrome$';                   Source = 'Chrome'
+       WingetId = 'Google.Chrome';               PackageMatch = '\bChrome\b' }
+    @{ Name = "Microsoft Edge";        Match = '^Microsoft Edge$';                  Source = 'Edge'
+       WingetId = 'Microsoft.Edge';              PackageMatch = '\bMicrosoft Edge\b(?!.*WebView)' }
+    @{ Name = "Mozilla Firefox";       Match = '^Mozilla Firefox\b(?!.*\bESR\b)';   Source = 'Url'
+       Url = 'https://product-details.mozilla.org/1.0/firefox_versions.json'; Regex = '"LATEST_FIREFOX_VERSION"\s*:\s*"([^"]+)"'
+       WingetId = 'Mozilla.Firefox';             PackageMatch = '\bFirefox\b(?!.*\bESR\b)' }
+    @{ Name = "Mozilla Firefox ESR";   Match = '^Mozilla Firefox\b.*\bESR\b';       Source = 'Url'
+       Url = 'https://product-details.mozilla.org/1.0/firefox_versions.json'; Regex = '"FIREFOX_ESR"\s*:\s*"([^"]+)"'
+       WingetId = 'Mozilla.Firefox.ESR';         PackageMatch = '\bFirefox\b.*\bESR\b' }
+    @{ Name = "Adobe Acrobat Reader";  Match = '^Adobe Acrobat\b';                  Source = 'Url'
+       Url = 'https://rdc.adobe.io/reader/products?lang=mui&site=enterprise&os=Windows%2011&api_key=dc-get-adobereader-cdn'; Regex = '"version"\s*:\s*"(\d+\.\d+\.\d+)"'
+       WingetId = 'Adobe.Acrobat.Reader.64-bit'; PackageMatch = '\bAcrobat\b|\bAdobe Reader\b' }
+    @{ Name = "7-Zip";                 Match = '^7-Zip\b';                          Source = 'GitHub'; Repo = 'ip7z/7zip'
+       WingetId = '7zip.7zip' }
+    @{ Name = "Notepad++";             Match = '^Notepad\+\+';                      Source = 'GitHub'; Repo = 'notepad-plus-plus/notepad-plus-plus'
+       WingetId = 'Notepad++.Notepad++' }
+    @{ Name = "VLC media player";      Match = '^VLC media player\b';               Source = 'Url'
+       Url = 'https://update.videolan.org/vlc/status-win-x64'; Regex = '^\s*(\d+(?:\.\d+)+)'
+       WingetId = 'VideoLAN.VLC';                PackageMatch = '\bVLC\b' }
+    @{ Name = "Visual Studio Code";    Match = '^Microsoft Visual Studio Code\b(?!.*Insiders)'; Source = 'Url'
+       Url = 'https://update.code.visualstudio.com/api/update/win32-x64/stable/latest'; Regex = '"productVersion"\s*:\s*"([^"]+)"'
+       WingetId = 'Microsoft.VisualStudioCode';  PackageMatch = 'Visual Studio Code|\bVS ?Code\b' }
+    @{ Name = "Git for Windows";       Match = '^Git( version [\d.]+)?$';           Source = 'GitHub'; Repo = 'git-for-windows/git'
+       WingetId = 'Git.Git';                     PackageMatch = '^Git\b(?! Extensions)' }
+    @{ Name = "PowerToys";             Match = '^PowerToys\b';                      Source = 'GitHub'; Repo = 'microsoft/PowerToys'
+       WingetId = 'Microsoft.PowerToys' }
+    @{ Name = "KeePassXC";             Match = '^KeePassXC\b';                      Source = 'GitHub'; Repo = 'keepassxreboot/keepassxc'
+       WingetId = 'KeePassXCTeam.KeePassXC' }
+    @{ Name = "WinSCP";                Match = '^WinSCP\b';                         Source = 'Winget'; WingetId = 'WinSCP.WinSCP' }
+    @{ Name = "PuTTY";                 Match = '^PuTTY\b';                          Source = 'Winget'; WingetId = 'PuTTY.PuTTY' }
+    @{ Name = "FileZilla";             Match = '^FileZilla\b(?!.*Server)';          Source = 'Winget'; WingetId = 'TimKosse.FileZilla.Client' }
+    @{ Name = "TeamViewer";            Match = '^TeamViewer\b';                     Source = 'Winget'; WingetId = 'TeamViewer.TeamViewer' }
+)
+$AppUpdateCacheFile         = "C:\temp\dashboard-app-versions.json"   # dernières versions déjà trouvées
+$AppUpdateCacheHours        = 12      # validité du cache : au-delà, nouvelle recherche en ligne
+$AppUpdateWebTimeoutSec     = 20      # délai maximal d'une requête vers un site éditeur (secondes)
+$AppUpdateMaxDeviceLookups  = 200     # versions en retard dont les postes sont listés (appels groupés par 20)
+$AppUpdateChromeMinFraction = 0.2     # Chrome est déployé par paliers : version servie à >= 20 % des postes
+$GitHubApiToken             = ""      # facultatif : jeton GitHub (lecture publique), 60 -> 5 000 requêtes/heure
+
 # ===== COORDONNÉES ENTREPRISE PAR DÉFAUT =====
 $DefaultCompanyName   = "ECONOCOM"
 $DefaultContactPerson = "Nom si nécessaire"
@@ -184,6 +265,7 @@ $Colors = @{
     Hardware        = "#92400e"   # Ambre brûlé
     DetailTables    = "#334155"   # Ardoise - tables de détail
     Health          = "#0f766e"   # [v4.0] Sarcelle profonde - page Santé & proactivité
+    AppUpdates      = "#86198f"   # [v4.1] Fuchsia profond - mises à jour des applications
     # Couleurs d'identification des plateformes (cartes Overview)
     PlatformWindows = "#2563eb"
     PlatformIOS     = "#0e7490"
@@ -2584,13 +2666,46 @@ function Get-ManagedDevicesRest {
     return $list.ToArray()
 }
 
+# [v4.1] Libellés des types d'applications Intune (@odata.type), table "All Intune Applications"
+$MobileAppTypeLabels = @{
+    win32LobApp             = 'Win32'
+    win32CatalogApp         = 'Win32 (Enterprise App Catalog)'
+    windowsMobileMSI        = 'MSI (métier)'
+    winGetApp               = 'Microsoft Store (winget)'
+    windowsStoreApp         = 'Microsoft Store'
+    windowsUniversalAppX    = 'MSIX / AppX (métier)'
+    officeSuiteApp          = 'Microsoft 365 Apps'
+    windowsMicrosoftEdgeApp = 'Microsoft Edge'
+    webApp                  = 'Lien web'
+    iosStoreApp             = 'iOS (App Store)'
+    iosVppApp               = 'iOS (VPP)'
+    iosLobApp               = 'iOS (métier)'
+    managedIOSStoreApp      = 'iOS (App Store, gérée)'
+    androidManagedStoreApp  = 'Android (Managed Google Play)'
+    androidStoreApp         = 'Android (Play Store)'
+    androidLobApp           = 'Android (métier)'
+    macOSLobApp             = 'macOS (métier)'
+    macOSDmgApp             = 'macOS (DMG)'
+    macOSPkgApp             = 'macOS (PKG)'
+    macOSMicrosoftEdgeApp   = 'macOS (Microsoft Edge)'
+    macOsVppApp             = 'macOS (VPP)'
+}
+
 function Get-MobileAppsRest {
     param([string]$AccessToken = "")
     foreach ($a in @(Get-GraphPagedResults -Url "https://graph.microsoft.com/v1.0/deviceAppManagement/mobileApps" -AccessToken $AccessToken)) {
         if ($null -eq $a) { continue }
+        # [v4.1] Type et version publiée (Win32 : displayVersion, MSI : productVersion...),
+        # pour signaler les packages plus anciens que la dernière version de l'éditeur
+        $typeKey = "$($a.'@odata.type')" -replace '^#?microsoft\.graph\.', ''
+        $typeLbl = $typeKey
+        if ($MobileAppTypeLabels.ContainsKey($typeKey)) { $typeLbl = $MobileAppTypeLabels[$typeKey] }
         [pscustomobject]@{
             DisplayName     = [string]$a.displayName
             Publisher       = [string]$a.publisher
+            AppType         = $typeLbl
+            AppTypeKey      = $typeKey
+            Version         = [string](Get-PropValue $a @('displayVersion', 'productVersion', 'versionName', 'versionNumber', 'bundleVersion', 'primaryBundleVersion'))
             Id              = [string]$a.id
             CreatedDateTime = ConvertTo-UtcDate $a.createdDateTime
         }
@@ -2654,7 +2769,9 @@ function Get-UpdateRingData {
         try {
             $statuses = @(Get-GraphPagedResults -Url "https://graph.microsoft.com/beta/deviceManagement/deviceConfigurations/$($pol.id)/deviceStatuses?`$top=1000" -AccessToken $AccessToken)
         } catch {
-            if ($Warnings) { $Warnings.Add("Update Ring « $($pol.displayName) » : $($_.Exception.Message)") }
+            # [v4.1] "$null -ne" : une liste VIDE vaut $false en PowerShell ; avec "if ($Warnings)",
+            # le premier avertissement n'était jamais ajouté (défaut de la v4.0)
+            if ($null -ne $Warnings) { $Warnings.Add("Update Ring « $($pol.displayName) » : $($_.Exception.Message)") }
             continue
         }
         $userStatuses = @($statuses | Where-Object { $_ -and $_.userName -and "$($_.userName)".Trim() -ne "" -and $_.userName -ne "System account" -and $_.userName -match "@" })
@@ -2841,13 +2958,13 @@ function Get-ConfigurationProfileErrors {
             if ($p -and $p.id) { $profiles.Add([pscustomobject]@{ Id = [string]$p.id; Name = [string]$p.name; Segment = "configurationPolicies" }) }
         }
     } catch {
-        if ($Warnings) { $Warnings.Add("Catalogue de paramètres indisponible : $($_.Exception.Message)") }
+        if ($null -ne $Warnings) { $Warnings.Add("Catalogue de paramètres indisponible : $($_.Exception.Message)") }
     }
 
     $list = @($profiles)
     if ($list.Count -eq 0) { return @() }
     if ($list.Count -gt $MaxProfiles) {
-        if ($Warnings) { $Warnings.Add("Profils de configuration : $($list.Count) profils, analyse limitée aux $MaxProfiles premiers (`$MaxConfigProfilesAnalyzed).") }
+        if ($null -ne $Warnings) { $Warnings.Add("Profils de configuration : $($list.Count) profils, analyse limitée aux $MaxProfiles premiers (`$MaxConfigProfilesAnalyzed).") }
         $list = $list[0..($MaxProfiles - 1)]
     }
 
@@ -2885,7 +3002,7 @@ function Get-ConfigurationProfileErrors {
             })
         }
     }
-    if ($truncated -gt 0 -and $Warnings) { $Warnings.Add("Profils de configuration : $truncated profil(s) de plus de 999 postes, décompte partiel pour ceux-là.") }
+    if ($truncated -gt 0 -and $null -ne $Warnings) { $Warnings.Add("Profils de configuration : $truncated profil(s) de plus de 999 postes, décompte partiel pour ceux-là.") }
     Write-Log "Profils de configuration : $($failures.Count) application(s) en erreur ou en conflit sur $($list.Count) profil(s)."
     return $failures.ToArray()
 }
@@ -3479,6 +3596,917 @@ function New-HealthDashboardHeadHtml {
 }
 
 # ========================================
+# [v4.1] MISES À JOUR DES APPLICATIONS
+# ========================================
+# OBJECTIF : savoir quelles applications du parc sont en retard sur la dernière version
+# publiée par leur éditeur, sur combien de postes, et lesquels.
+# SOURCES :
+#   * versions installées : inventaire Intune « Applications découvertes »
+#     (GET /deviceManagement/detectedApps : une entrée par application ET par version,
+#     avec son nombre de postes) ; postes d'une version en retard :
+#     /detectedApps/{id}/managedDevices, appels regroupés en $batch ;
+#   * packages publiés : applications Intune Win32 / MSI (mobileApps, déjà lues) ;
+#   * dernières versions : sources officielles listées dans $AppUpdateCatalog, winget en
+#     secours, résultats gardés en cache $AppUpdateCacheHours h ($AppUpdateCacheFile).
+# Les requêtes vers Internet ne transmettent AUCUNE donnée du tenant : seules des pages
+# publiques d'éditeurs sont lues (ni jeton Graph, ni nom de poste ou d'application).
+# LIMITES (rappelées dans la page) :
+#   * Intune n'inventorie les applications que des postes d'entreprise, environ tous les
+#     7 jours : un poste mis à jour hier peut encore apparaître dans son ancienne version ;
+#   * le nombre de postes par version vient d'Intune et couvre tout le tenant (VM
+#     comprises) ; la liste nominative des postes, elle, suit le périmètre analysé ;
+#   * les navigateurs se mettent à jour seuls : un retard mineur de quelques jours est
+#     normal ; un retard de version MAJEURE signale un poste qui ne se met plus à jour.
+# Chaque étape est en "meilleur effort" : une source muette devient un avertissement,
+# jamais un arrêt de la génération.
+
+# Statut d'une installation ou d'une application (préfixe numérique : tri par urgence)
+$AppUpdateStatusLabels = @{
+    major   = "1 - Retard de version majeure"
+    minor   = "2 - Mise à jour mineure en attente"
+    ok      = "3 - À jour"
+    unknown = "4 - Non vérifiable"
+}
+$AppUpdateStatusRank = @{ unknown = 0; ok = 1; minor = 2; major = 3 }
+
+# Chemin de winget.exe : $null = pas encore cherché, "" = absent du poste
+$script:WingetPath = $null
+# Pages éditeurs déjà lues pendant la recherche en cours (Firefox et Firefox ESR partagent
+# la même page) : $null hors recherche
+$script:AppWebMemo = $null
+
+# --- Versions : lecture et comparaison ---
+
+# Partie numérique d'une version : "v8.7" -> 8,7 ; "128.3.0esr" -> 128,3,0 ;
+# "ad 8.1.0" -> 8,1,0. $null si aucun nombre. La virgule du "return" empêche
+# PowerShell de déplier un tableau d'un seul segment ("24" -> 24 et non [24]).
+function ConvertTo-AppVersionParts {
+    param([AllowNull()][string]$Version)
+    if ([string]::IsNullOrWhiteSpace($Version)) { return $null }
+    $m = [regex]::Match($Version, '\d+(?:\.\d+)*')
+    if (-not $m.Success) { return $null }
+    $parts = [System.Collections.Generic.List[long]]::new()
+    foreach ($s in $m.Value.Split('.')) {
+        $n = [long]0
+        if (-not [long]::TryParse($s, [ref]$n)) { return $null }
+        $parts.Add($n)
+    }
+    return , $parts.ToArray()
+}
+
+# -1 / 0 / 1 entre deux versions déjà découpées, segments manquants comptés à 0
+function Compare-AppVersionParts {
+    param([long[]]$A, [long[]]$B)
+    $len = [math]::Max($A.Count, $B.Count)
+    for ($i = 0; $i -lt $len; $i++) {
+        $x = [long]0
+        $y = [long]0
+        if ($i -lt $A.Count) { $x = $A[$i] }
+        if ($i -lt $B.Count) { $y = $B[$i] }
+        if ($x -lt $y) { return -1 }
+        if ($x -gt $y) { return 1 }
+    }
+    return 0
+}
+
+# -1 / 0 / 1 ("24.08" = "24.08.00.0") ; $null si l'une des versions est illisible
+function Compare-AppVersion {
+    param([AllowNull()][string]$A, [AllowNull()][string]$B)
+    $pa = ConvertTo-AppVersionParts $A
+    $pb = ConvertTo-AppVersionParts $B
+    if ($null -eq $pa -or $null -eq $pb) { return $null }
+    return (Compare-AppVersionParts $pa $pb)
+}
+
+# Plus haute version lisible d'une liste ($null si aucune) ; chaque version n'est lue qu'une fois
+function Get-MaxAppVersion {
+    param([AllowNull()][AllowEmptyCollection()][string[]]$Versions)
+    $best      = $null
+    $bestParts = $null
+    foreach ($v in @($Versions)) {
+        $parts = ConvertTo-AppVersionParts $v
+        if ($null -eq $parts) { continue }
+        if ($null -eq $bestParts -or (Compare-AppVersionParts $parts $bestParts) -gt 0) { $best = "$v".Trim(); $bestParts = $parts }
+    }
+    return $best
+}
+
+# État d'une version installée face à la dernière : ok / minor / major / unknown.
+# "major" = premier segment en retard (Chrome 154 -> 155, 7-Zip 23.01 -> 24.08).
+function Get-AppVersionState {
+    param([AllowNull()][string]$Installed, [AllowNull()][string]$Latest)
+    $cmp = Compare-AppVersion $Installed $Latest
+    if ($null -eq $cmp) { return 'unknown' }
+    if ($cmp -ge 0) { return 'ok' }
+    $pa = ConvertTo-AppVersionParts $Installed
+    $pb = ConvertTo-AppVersionParts $Latest
+    if ($pa[0] -lt $pb[0]) { return 'major' }
+    return 'minor'
+}
+
+# --- Dernières versions : sources sur Internet ---
+
+# Lecture d'une page publique (texte UTF-8), SANS jeton Graph. Une nouvelle tentative
+# sur erreur réseau, 429 ou 5xx ; message d'erreur court et explicite sinon.
+function Invoke-AppVersionWebRequest {
+    param([Parameter(Mandatory = $true)][string]$Uri, [hashtable]$Headers = @{}, [int]$MaxAttempts = 2)
+    $hostName = $Uri
+    try { $hostName = ([uri]$Uri).Host } catch { }
+    if ($script:AppWebMemo -and $script:AppWebMemo.ContainsKey($Uri)) { return $script:AppWebMemo[$Uri] }
+    for ($attempt = 1; ; $attempt++) {
+        try {
+            $params = @{ Uri = $Uri; Method = 'GET'; UseBasicParsing = $true; TimeoutSec = $AppUpdateWebTimeoutSec; ErrorAction = 'Stop' }
+            if ($Headers -and $Headers.Count -gt 0) { $params.Headers = $Headers }
+            $web  = Invoke-WebRequest @params
+            $text = [System.Text.Encoding]::UTF8.GetString($web.RawContentStream.ToArray())
+            if ($script:AppWebMemo) { $script:AppWebMemo[$Uri] = $text }
+            return $text
+        } catch {
+            $status = 0
+            try { if ($_.Exception.Response) { $status = [int]$_.Exception.Response.StatusCode } } catch { }
+            if ($attempt -lt $MaxAttempts -and ($status -eq 0 -or $status -in @(429, 500, 502, 503, 504))) {
+                Start-ResponsiveSleep -Seconds (3 * $attempt) -Message "Site $hostName : nouvelle tentative"
+                continue
+            }
+            if ($status -gt 0) { throw "$hostName a répondu HTTP $status" }
+            throw "$hostName injoignable ($($_.Exception.Message))"
+        }
+    }
+}
+
+# Plus haute version capturée par Regex (1er groupe, sinon la correspondance entière)
+function Get-UrlRegexVersion {
+    param([Parameter(Mandatory = $true)][string]$Url, [Parameter(Mandatory = $true)][string]$Regex)
+    $text  = Invoke-AppVersionWebRequest -Uri $Url
+    $found = foreach ($m in [regex]::Matches($text, $Regex, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)) {
+        if ($m.Groups.Count -gt 1 -and $m.Groups[1].Success) { $m.Groups[1].Value } else { $m.Value }
+    }
+    $max = Get-MaxAppVersion @($found)
+    if (-not $max) {
+        $h = $Url
+        try { $h = ([uri]$Url).Host } catch { }
+        throw "$h : aucune version trouvée dans la réponse (motif « $Regex »)"
+    }
+    return $max
+}
+
+# Dernière release PUBLIÉE d'un dépôt GitHub (les préversions sont exclues par l'API)
+function Get-GitHubLatestVersion {
+    param([Parameter(Mandatory = $true)][string]$Repo, [string]$TagRegex)
+    if (-not $TagRegex) { $TagRegex = '(\d+(?:\.\d+)+)' }
+    $headers = @{}
+    if ($GitHubApiToken) { $headers.Authorization = "Bearer $GitHubApiToken" }
+    try {
+        $json = (Invoke-AppVersionWebRequest -Uri "https://api.github.com/repos/$Repo/releases/latest" -Headers $headers) | ConvertFrom-Json
+    } catch {
+        if ("$($_.Exception.Message)" -match 'HTTP (403|429)') {
+            throw "$($_.Exception.Message) : limite de l'API GitHub probablement atteinte (60 requêtes/heure sans jeton, voir `$GitHubApiToken)"
+        }
+        throw
+    }
+    foreach ($candidate in @("$($json.tag_name)", "$($json.name)")) {
+        $m = [regex]::Match($candidate, $TagRegex)
+        if ($m.Success) {
+            if ($m.Groups.Count -gt 1 -and $m.Groups[1].Success) { return $m.Groups[1].Value }
+            return $m.Value
+        }
+    }
+    throw "GitHub $Repo : aucune version reconnaissable dans l'étiquette « $($json.tag_name) »"
+}
+
+# Chrome Stable pour Windows 64 bits. Google déploie chaque version PAR PALIERS : la plus
+# récente n'est souvent servie qu'à 0,5 % des postes. On retient la plus haute version
+# servie à au moins $AppUpdateChromeMinFraction des postes, sinon tout le parc
+# paraîtrait en retard à chaque nouvelle version.
+function Get-ChromeLatestVersion {
+    $uri  = "https://versionhistory.googleapis.com/v1/chrome/platforms/win64/channels/stable/versions/all/releases?filter=endtime=none"
+    $json = (Invoke-AppVersionWebRequest -Uri $uri) | ConvertFrom-Json
+    $serving = @($json.releases | Where-Object { $_ -and $_.version })
+    if ($serving.Count -eq 0) { throw "API Google : aucune version Stable en cours de diffusion" }
+    $wide = @($serving | Where-Object {
+        $f = 0.0
+        try { $f = [double]$_.fraction } catch { }
+        $f -ge $AppUpdateChromeMinFraction
+    })
+    if ($wide.Count -eq 0) { $wide = $serving }
+    return (Get-MaxAppVersion @($wide | ForEach-Object { [string]$_.version }))
+}
+
+# Microsoft Edge Stable pour Windows (API publique utilisée par la page de téléchargement Entreprise)
+function Get-EdgeLatestVersion {
+    $json     = (Invoke-AppVersionWebRequest -Uri "https://edgeupdates.microsoft.com/api/products") | ConvertFrom-Json
+    $stable   = @(@($json) | Where-Object { "$($_.Product)" -eq 'Stable' })
+    $versions = @($stable | ForEach-Object { @($_.Releases) } | Where-Object { $_ -and "$($_.Platform)" -eq 'Windows' } | ForEach-Object { [string]$_.ProductVersion })
+    $max      = Get-MaxAppVersion $versions
+    if (-not $max) { throw "API Microsoft Edge : aucune version Stable pour Windows" }
+    return $max
+}
+
+# Programme externe (winget) lancé SANS geler la fenêtre : sortie lue en tâche de fond,
+# messages Windows pompés pendant l'attente, arrêt au-delà de $TimeoutSec.
+function Invoke-ExternalProcess {
+    param([Parameter(Mandatory = $true)][string]$FilePath, [string]$Arguments = "", [int]$TimeoutSec = 120)
+    $psi = [System.Diagnostics.ProcessStartInfo]::new($FilePath, $Arguments)
+    $psi.UseShellExecute        = $false
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError  = $true
+    $psi.CreateNoWindow         = $true
+    $psi.StandardOutputEncoding = [System.Text.Encoding]::UTF8
+    $proc = [System.Diagnostics.Process]::Start($psi)
+    try {
+        $outTask  = $proc.StandardOutput.ReadToEndAsync()
+        $errTask  = $proc.StandardError.ReadToEndAsync()
+        $deadline = [datetime]::UtcNow.AddSeconds($TimeoutSec)
+        while (-not $proc.HasExited) {
+            if ([datetime]::UtcNow -gt $deadline) {
+                try { $proc.Kill() } catch { }
+                throw "délai de $TimeoutSec s dépassé"
+            }
+            try { if ($form) { [System.Windows.Forms.Application]::DoEvents() } } catch { }
+            Start-Sleep -Milliseconds 100
+        }
+        $proc.WaitForExit()
+        return [pscustomobject]@{ ExitCode = $proc.ExitCode; Output = "$($outTask.Result)`n$($errTask.Result)" }
+    } finally {
+        $proc.Dispose()
+    }
+}
+
+# winget.exe du poste qui lance le script (App Installer de Windows 10 / 11)
+function Get-WingetPath {
+    if ($null -ne $script:WingetPath) { return $script:WingetPath }
+    $path = ""
+    $cmd  = Get-Command -Name 'winget.exe' -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($cmd) {
+        $path = [string]$cmd.Path
+    } elseif ($env:LOCALAPPDATA) {
+        $alias = Join-Path $env:LOCALAPPDATA 'Microsoft\WindowsApps\winget.exe'
+        if (Test-Path -LiteralPath $alias) { $path = $alias }
+    }
+    $script:WingetPath = $path
+    if (-not $path) { Write-Log "winget introuvable sur ce poste : pas de source de secours winget." -Level WARN }
+    return $path
+}
+
+# Dernière version d'un paquet du catalogue winget (sortie "Version: x.y.z", libellé
+# identique en anglais et en français)
+function Get-WingetLatestVersion {
+    param([Parameter(Mandatory = $true)][string]$Id)
+    $exe = Get-WingetPath
+    if (-not $exe) { throw "winget absent de ce poste (App Installer)" }
+    $r = Invoke-ExternalProcess -FilePath $exe -Arguments "show --id `"$Id`" --exact --source winget --accept-source-agreements" -TimeoutSec 120
+    $m = [regex]::Match("$($r.Output)", '(?im)^\s*Version\s*:\s*(\S+)')
+    if ($m.Success -and $null -ne (ConvertTo-AppVersionParts $m.Groups[1].Value)) { return $m.Groups[1].Value }
+    throw "paquet « $Id » introuvable ou sans version (code retour $($r.ExitCode))"
+}
+
+# Libellé de source affiché dans le rapport
+function Get-AppSourceLabel {
+    param([hashtable]$Entry, [string]$Kind)
+    switch ($Kind) {
+        'Chrome' { return "Google (API Chrome)" }
+        'Edge'   { return "Microsoft (API Edge)" }
+        'GitHub' { return "GitHub ($($Entry.Repo))" }
+        'Winget' { return "winget ($($Entry.WingetId))" }
+        'Url' {
+            $h = "$($Entry.Url)"
+            try { $h = ([uri]$Entry.Url).Host } catch { }
+            return "Éditeur ($h)"
+        }
+        default  { return $Kind }
+    }
+}
+
+# Dernière version d'une application du catalogue : source principale, puis winget en
+# secours. Ne lève pas d'exception : { Version; Source; Error }.
+function Get-AppLatestVersion {
+    param([Parameter(Mandatory = $true)][hashtable]$Entry, [bool]$UseWinget = $true)
+    $errors = [System.Collections.Generic.List[string]]::new()
+    $kind   = "$($Entry.Source)"
+    if ($kind -and $kind -ne 'Winget') {
+        $label = Get-AppSourceLabel -Entry $Entry -Kind $kind
+        try {
+            $v = switch ($kind) {
+                'Chrome' { Get-ChromeLatestVersion }
+                'Edge'   { Get-EdgeLatestVersion }
+                'GitHub' { Get-GitHubLatestVersion -Repo $Entry.Repo -TagRegex $Entry.TagRegex }
+                'Url'    { Get-UrlRegexVersion -Url $Entry.Url -Regex $Entry.Regex }
+                default  { throw "source « $kind » inconnue (attendu : Url, GitHub, Winget, Chrome ou Edge)" }
+            }
+            if ($null -ne (ConvertTo-AppVersionParts "$v")) {
+                return [pscustomobject]@{ Version = "$v".Trim(); Source = $label; Error = $null }
+            }
+            $errors.Add("$label : version illisible « $v »")
+        } catch {
+            $errors.Add("$label : $($_.Exception.Message)")
+        }
+    }
+    if ($Entry.WingetId) {
+        if ($UseWinget) {
+            try {
+                $v = Get-WingetLatestVersion -Id $Entry.WingetId
+                return [pscustomobject]@{ Version = "$v".Trim(); Source = (Get-AppSourceLabel -Entry $Entry -Kind 'Winget'); Error = $null }
+            } catch {
+                $errors.Add("winget : $($_.Exception.Message)")
+            }
+        } elseif ($kind -eq 'Winget' -or -not $kind) {
+            $errors.Add("winget désactivé dans les options (onglet Applications)")
+        }
+    }
+    if ($errors.Count -eq 0) { $errors.Add("aucune source configurée") }
+    return [pscustomobject]@{ Version = $null; Source = ""; Error = ($errors -join " ; ") }
+}
+
+# --- Cache des dernières versions (fichier JSON local) ---
+
+# Empreinte de la définition d'une source : une source modifiée invalide son cache
+function Get-AppCatalogSignature {
+    param([hashtable]$Entry)
+    return ((@('Source', 'Url', 'Regex', 'Repo', 'TagRegex', 'WingetId') | ForEach-Object { "$($Entry[$_])" }) -join '|')
+}
+
+# Nom d'application -> { Version; Source; CheckedUtc; Signature }. Fichier absent ou
+# illisible : cache vide (nouvelle recherche complète), jamais d'erreur.
+function Read-AppVersionCache {
+    param([string]$Path = $AppUpdateCacheFile)
+    $cache = @{}
+    try {
+        if (-not $Path -or -not (Test-Path -LiteralPath $Path)) { return $cache }
+        $raw = [System.IO.File]::ReadAllText($Path, [System.Text.Encoding]::UTF8)
+        if (-not $raw.Trim()) { return $cache }
+        $obj = $raw | ConvertFrom-Json
+        foreach ($p in $obj.PSObject.Properties) {
+            $v       = $p.Value
+            $checked = ConvertTo-UtcDate $v.CheckedUtc
+            if (-not $v.Version -or -not $checked) { continue }
+            $cache[$p.Name] = [pscustomobject]@{ Version = [string]$v.Version; Source = [string]$v.Source; CheckedUtc = $checked; Signature = [string]$v.Signature }
+        }
+    } catch {
+        Write-Log "Cache des versions illisible ($Path) : $($_.Exception.Message). Nouvelle recherche complète." -Level WARN
+        return @{}
+    }
+    return $cache
+}
+
+function Save-AppVersionCache {
+    param([hashtable]$Cache, [string]$Path = $AppUpdateCacheFile)
+    try {
+        $o = [ordered]@{}
+        foreach ($k in @($Cache.Keys | Sort-Object)) {
+            $c = $Cache[$k]
+            $o[$k] = [ordered]@{ Version = $c.Version; Source = $c.Source; CheckedUtc = $c.CheckedUtc.ToString('o'); Signature = $c.Signature }
+        }
+        $dir = Split-Path -Parent $Path
+        if ($dir -and -not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force -ErrorAction Stop | Out-Null }
+        [System.IO.File]::WriteAllText($Path, ($o | ConvertTo-Json -Depth 4), [System.Text.UTF8Encoding]::new($false))
+    } catch {
+        Write-Log "Cache des versions non enregistré ($Path) : $($_.Exception.Message)" -Level WARN
+    }
+}
+
+# Dernières versions des applications demandées : cache encore valide, sinon recherche
+# en ligne ; source muette -> dernière valeur connue du cache (datée), sinon inconnue.
+# -Online $false : aucun accès Internet, valeurs du cache quel que soit leur âge.
+# Retour : Nom -> { Version; Source; CheckedUtc; FromCache; Error }
+function Resolve-AppLatestVersions {
+    param(
+        [object[]]$Entries, [bool]$Online = $true, [bool]$UseWinget = $true, [bool]$UseCache = $true,
+        [System.Collections.Generic.List[string]]$Warnings
+    )
+    $results = @{}
+    $cache   = Read-AppVersionCache
+    $changed = $false
+    $script:AppWebMemo = @{ }
+    $nowUtc  = [datetime]::UtcNow
+    $missingOffline = [System.Collections.Generic.List[string]]::new()
+    $total = @($Entries).Count
+    $i = 0
+    foreach ($e in @($Entries)) {
+        $i++
+        $sig    = Get-AppCatalogSignature -Entry $e
+        $cached = $null
+        if ($cache.ContainsKey($e.Name) -and $cache[$e.Name].Signature -eq $sig) { $cached = $cache[$e.Name] }
+        $fresh  = $cached -and ($nowUtc - $cached.CheckedUtc).TotalHours -lt $AppUpdateCacheHours
+
+        if ($cached -and (-not $Online -or ($UseCache -and $fresh))) {
+            $results[$e.Name] = [pscustomobject]@{ Version = $cached.Version; Source = $cached.Source; CheckedUtc = $cached.CheckedUtc; FromCache = $true; Error = $null }
+            continue
+        }
+        if (-not $Online) {
+            $missingOffline.Add($e.Name)
+            $results[$e.Name] = [pscustomobject]@{ Version = $null; Source = ""; CheckedUtc = $null; FromCache = $false; Error = "recherche en ligne désactivée, aucune version en cache" }
+            continue
+        }
+
+        Set-UiStatus "🌐 Dernière version publiée : $($e.Name) ($i / $total)..."
+        $r = Get-AppLatestVersion -Entry $e -UseWinget $UseWinget
+        if ($r.Version) {
+            $results[$e.Name] = [pscustomobject]@{ Version = $r.Version; Source = $r.Source; CheckedUtc = $nowUtc; FromCache = $false; Error = $null }
+            $cache[$e.Name]   = [pscustomobject]@{ Version = $r.Version; Source = $r.Source; CheckedUtc = $nowUtc; Signature = $sig }
+            $changed = $true
+            Write-Log "Dernière version $($e.Name) : $($r.Version) - $($r.Source)"
+        } elseif ($cached) {
+            $results[$e.Name] = [pscustomobject]@{ Version = $cached.Version; Source = $cached.Source; CheckedUtc = $cached.CheckedUtc; FromCache = $true; Error = $r.Error }
+            if ($null -ne $Warnings) { $Warnings.Add("$($e.Name) : source injoignable ($($r.Error)) ; version du $(Format-LocalDate $cached.CheckedUtc) reprise du cache.") }
+        } else {
+            $results[$e.Name] = [pscustomobject]@{ Version = $null; Source = ""; CheckedUtc = $null; FromCache = $false; Error = $r.Error }
+            if ($null -ne $Warnings) { $Warnings.Add("$($e.Name) : dernière version introuvable ($($r.Error)).") }
+        }
+    }
+    if ($missingOffline.Count -gt 0 -and $null -ne $Warnings) {
+        $Warnings.Add("Recherche en ligne désactivée : aucune version en cache pour $($missingOffline -join ', ').")
+    }
+    $script:AppWebMemo = $null
+    if ($changed) { Save-AppVersionCache -Cache $cache }
+    return $results
+}
+
+# --- Inventaire Intune (applications découvertes) ---
+
+function Get-AppPlatformLabel {
+    param([AllowNull()][string]$Platform)
+    switch -Regex ("$Platform") {
+        '^windows'      { return 'Windows' }
+        '^macos$'       { return 'macOS' }
+        '^ios$'         { return 'iOS' }
+        '^android'      { return 'Android' }
+        '^chromeos'     { return 'ChromeOS' }
+        '^(unknown)?$'  { return 'Inconnue' }
+        default         { return "$Platform" }
+    }
+}
+
+# Une entrée par application ET par version : { Id; Name; Version; Publisher; Platform; DeviceCount }
+function Get-DetectedAppsRest {
+    param([string]$AccessToken = "")
+    $base = "https://graph.microsoft.com/v1.0/deviceManagement/detectedApps"
+    try {
+        $items = @(Get-GraphPagedResults -Url "${base}?`$top=999" -AccessToken $AccessToken)
+    } catch {
+        # Taille de page refusée : pagination par défaut du service (plus d'appels, même résultat)
+        if ((Get-GraphExceptionStatus -Exception $_.Exception) -ne 400) { throw }
+        Write-Log "Applications découvertes : `$top refusé par le service, lecture avec la pagination par défaut." -Level WARN
+        $items = @(Get-GraphPagedResults -Url $base -AccessToken $AccessToken)
+    }
+    $list      = [System.Collections.Generic.List[object]]::new()
+    $platforms = @{}   # libellé de plateforme calculé une fois par valeur (des dizaines de milliers d'entrées)
+    foreach ($a in $items) {
+        if ($null -eq $a -or -not $a.displayName) { continue }
+        $count = 0
+        try { $count = [int]$a.deviceCount } catch { }
+        $raw = [string]$a.platform
+        if (-not $platforms.ContainsKey($raw)) { $platforms[$raw] = Get-AppPlatformLabel $raw }
+        $list.Add([pscustomobject]@{
+            Id          = [string]$a.id
+            Name        = ([string]$a.displayName).Trim()
+            Version     = ([string]$a.version).Trim()
+            Publisher   = ([string]$a.publisher).Trim()
+            Platform    = $platforms[$raw]
+            DeviceCount = $count
+        })
+    }
+    return $list.ToArray()
+}
+
+# Postes (ids Intune) de chaque version d'application, par lots de 20 ($batch). Si le
+# service refuse $select sur cette navigation (400), le lot est rejoué sans ; les listes
+# de plus d'une page sont complétées par leur nextLink. Retour : idVersion -> ids postes.
+function Get-DetectedAppDeviceIds {
+    param([string[]]$DetectedAppIds, [string]$AccessToken = "", [System.Collections.Generic.List[string]]$Warnings)
+    $map     = @{}
+    $pending = @($DetectedAppIds | Where-Object { $_ } | Select-Object -Unique)
+    $failed  = 0
+    foreach ($withSelect in @($true, $false)) {
+        if ($pending.Count -eq 0) { break }
+        $requests = [System.Collections.Generic.List[object]]::new()
+        $byReq    = @{}
+        $n        = 0
+        foreach ($id in $pending) {
+            $n++
+            $byReq["v$n"] = $id
+            $url = "/deviceManagement/detectedApps/$([uri]::EscapeDataString($id))/managedDevices"
+            if ($withSelect) { $url += "?`$select=id,deviceName" }
+            $requests.Add(@{ id = "v$n"; method = "GET"; url = $url })
+        }
+        $responses = Invoke-GraphBatch -Requests $requests.ToArray() -AccessToken $AccessToken -GraphVersion 'v1.0' -Label "Postes par version d'application"
+        $retry = [System.Collections.Generic.List[string]]::new()
+        foreach ($r in @($responses)) {
+            if ($null -eq $r -or -not $byReq.ContainsKey([string]$r.id)) { continue }
+            $appId  = $byReq[[string]$r.id]
+            $status = 0
+            try { $status = [int]$r.status } catch { }
+            if ($status -eq 400 -and $withSelect) { $retry.Add($appId); continue }
+            if ($status -ne 200 -or -not $r.body) { $failed++; continue }
+            $ids = [System.Collections.Generic.List[string]]::new()
+            foreach ($d in @($r.body.value)) { if ($d -and $d.id) { $ids.Add([string]$d.id) } }
+            $next = [string]$r.body.'@odata.nextLink'
+            if ($next) {
+                try {
+                    foreach ($d in @(Get-GraphPagedResults -Url $next -AccessToken $AccessToken)) { if ($d -and $d.id) { $ids.Add([string]$d.id) } }
+                } catch { $failed++ }
+            }
+            $map[$appId] = $ids.ToArray()
+        }
+        $pending = @($retry)
+    }
+    if ($failed -gt 0 -and $null -ne $Warnings) { $Warnings.Add("Postes à mettre à jour : $failed liste(s) de postes non lue(s) (droits ou erreur Graph), liste partielle.") }
+    return $map
+}
+
+# État du parc applicatif : une ligne par application et plateforme (toutes versions)
+function Get-AppInventory {
+    param([object[]]$DetectedApps, [hashtable]$CatalogByName)
+    $groups = @{}
+    foreach ($a in @($DetectedApps)) {
+        $key = "$($a.Name.ToLowerInvariant())|$($a.Platform)"
+        if (-not $groups.ContainsKey($key)) { $groups[$key] = [System.Collections.Generic.List[object]]::new() }
+        $groups[$key].Add($a)
+    }
+    # Boucles simples, sans pipeline : des milliers d'applications sur un grand parc
+    $rows = foreach ($key in $groups.Keys) {
+        $items     = $groups[$key]
+        $first     = $items[0]
+        $top       = $first
+        $publisher = ""
+        $devices   = 0
+        $distinct  = [System.Collections.Generic.HashSet[string]]::new()
+        $versions  = [System.Collections.Generic.List[string]]::new()
+        foreach ($it in $items) {
+            $devices += $it.DeviceCount
+            if ($it.DeviceCount -gt $top.DeviceCount) { $top = $it }
+            if (-not $publisher -and $it.Publisher) { $publisher = $it.Publisher }
+            if ($distinct.Add([string]$it.Version)) { $versions.Add([string]$it.Version) }
+        }
+        $tracked   = ""
+        $entry     = $CatalogByName[$first.Name.ToLowerInvariant()]
+        if ($entry -and $first.Platform -in @('Windows', 'Inconnue')) { $tracked = "Oui ($($entry.Name))" }
+        [pscustomobject][ordered]@{
+            'Application'              = $first.Name
+            'Éditeur'                  = "$publisher"
+            'Plateforme'               = $first.Platform
+            'Postes'                   = $devices
+            'Versions différentes'     = $distinct.Count
+            'Version la plus répandue' = $top.Version
+            'Version la plus récente'  = Get-MaxAppVersion $versions.ToArray()
+            'Suivi des mises à jour'   = $tracked
+        }
+    }
+    return @($rows | Where-Object { $null -ne $_ } | Sort-Object @{ Expression = { $_.'Postes' }; Descending = $true }, @{ Expression = { $_.'Application' } })
+}
+
+# --- Analyse complète ---
+
+# Inventaire + dernières versions + comparaison + postes et packages en retard.
+# Ne lève pas d'exception : un inventaire illisible rend Success = $false et Error.
+function Invoke-AppUpdateAnalysis {
+    param(
+        [object[]]$ScopeDevices, [object[]]$ManagedApps, [object[]]$Catalog,
+        [bool]$Online = $true, [bool]$UseWinget = $true, [bool]$UseCache = $true, [bool]$ListDevices = $true,
+        [string]$AccessToken = "", [bool]$AnonymizeData = $false,
+        [System.Collections.Generic.List[string]]$Warnings
+    )
+    if ($null -eq $Warnings) { $Warnings = [System.Collections.Generic.List[string]]::new() }
+    $res = [pscustomobject]@{
+        Success = $false; Error = $null; Online = $Online
+        Inventory = @(); Summary = @(); Versions = @(); Devices = @(); Packages = @()
+        CatalogCount = 0; TrackedCount = 0; InventoryCount = 0
+        InstallsOk = 0; InstallsMinor = 0; InstallsMajor = 0; InstallsUnknown = 0
+        AppsBehind = 0; PackagesBehind = 0; DevicesListed = 0
+    }
+
+    # 1. Catalogue : une entrée incomplète ou une expression régulière fautive est
+    #    signalée puis ignorée, sans bloquer les autres applications
+    $entries = [System.Collections.Generic.List[hashtable]]::new()
+    $names   = @{}
+    foreach ($e in @($Catalog)) {
+        if ($e -isnot [hashtable] -or -not $e.Name -or -not $e.Match) { $Warnings.Add("Catalogue des applications : entrée sans Name ou Match ignorée."); continue }
+        if ($names.ContainsKey([string]$e.Name)) { $Warnings.Add("Catalogue des applications : « $($e.Name) » en double, seconde entrée ignorée."); continue }
+        $valid = $true
+        foreach ($k in @('Match', 'PackageMatch', 'Regex', 'TagRegex')) {
+            if (-not $e[$k]) { continue }
+            try { [void][regex]::new([string]$e[$k]) } catch { $Warnings.Add("Catalogue « $($e.Name) » : expression $k invalide ($($_.Exception.Message))."); $valid = $false }
+        }
+        if ($valid) { $names[[string]$e.Name] = $true; $entries.Add($e) }
+    }
+    $res.CatalogCount = $entries.Count
+
+    # 2. Inventaire Intune
+    Write-Step "🧾 Inventaire des applications du parc (applications découvertes)..."
+    try {
+        $detected = @(Get-DetectedAppsRest -AccessToken $AccessToken)
+    } catch {
+        $res.Error = "Inventaire Intune (applications découvertes) indisponible : $($_.Exception.Message)"
+        $Warnings.Add($res.Error)
+        return $res
+    }
+    Write-Log "Applications découvertes : $($detected.Count) couple(s) application / version."
+
+    # Nom d'application -> entrée du catalogue (première correspondante), calculé une fois par nom.
+    # Expressions compilées une seule fois : le cache .NET des [regex]::IsMatch statiques ne
+    # garde que 15 motifs, moins que le catalogue (recompilation à chaque nom sinon).
+    $ignoreCase = [System.Text.RegularExpressions.RegexOptions]::IgnoreCase
+    $matchers   = @(foreach ($e in $entries) {
+        $pm = [regex]::Escape([string]$e.Name)
+        if ($e.PackageMatch) { $pm = [string]$e.PackageMatch }
+        [pscustomobject]@{ Entry = $e; Name = [regex]::new([string]$e.Match, $ignoreCase); Package = [regex]::new($pm, $ignoreCase) }
+    })
+    $catalogByName = @{}
+    foreach ($a in $detected) {
+        $k = $a.Name.ToLowerInvariant()
+        if ($catalogByName.ContainsKey($k)) { continue }
+        $catalogByName[$k] = $null
+        foreach ($m in $matchers) {
+            if ($m.Name.IsMatch($a.Name)) { $catalogByName[$k] = $m.Entry; break }
+        }
+    }
+    $res.Inventory      = @(Get-AppInventory -DetectedApps $detected -CatalogByName $catalogByName)
+    $res.InventoryCount = $res.Inventory.Count
+
+    # Applications suivies présentes sur le parc (catalogue Windows)
+    $trackedRows = @($detected | Where-Object { $_.Platform -in @('Windows', 'Inconnue') -and $catalogByName[$_.Name.ToLowerInvariant()] })
+
+    # 3. Packages Intune Win32 / MSI rattachés au catalogue
+    $packageMatches = [System.Collections.Generic.List[object]]::new()
+    foreach ($app in @($ManagedApps)) {
+        if ($null -eq $app -or "$($app.AppTypeKey)" -notin @('win32LobApp', 'win32CatalogApp', 'windowsMobileMSI')) { continue }
+        foreach ($m in $matchers) {
+            if ($m.Package.IsMatch([string]$app.DisplayName)) {
+                $packageMatches.Add([pscustomobject]@{ App = $app; Entry = $m.Entry })
+                break
+            }
+        }
+    }
+
+    # 4. Dernières versions : uniquement pour les applications présentes (parc ou packages)
+    $needed    = [System.Collections.Generic.List[hashtable]]::new()
+    $neededSet = @{}
+    foreach ($r in $trackedRows) {
+        $e = $catalogByName[$r.Name.ToLowerInvariant()]
+        if (-not $neededSet.ContainsKey($e.Name)) { $neededSet[$e.Name] = $true; $needed.Add($e) }
+    }
+    $res.TrackedCount = $needed.Count
+    foreach ($p in $packageMatches) {
+        if (-not $neededSet.ContainsKey($p.Entry.Name)) { $neededSet[$p.Entry.Name] = $true; $needed.Add($p.Entry) }
+    }
+    $latest = @{}
+    if ($needed.Count -gt 0) {
+        $how = if ($Online) { "recherche en ligne" } else { "cache local uniquement" }
+        Write-Step "🌐 Dernières versions publiées : $($needed.Count) application(s) ($how)..."
+        $latest = Resolve-AppLatestVersions -Entries $needed.ToArray() -Online $Online -UseWinget $UseWinget -UseCache $UseCache -Warnings $Warnings
+    }
+
+    # 5. Comparaison, version installée par version installée
+    $versions = [System.Collections.Generic.List[object]]::new()
+    foreach ($r in $trackedRows) {
+        $e  = $catalogByName[$r.Name.ToLowerInvariant()]
+        $lv = $null
+        if ($latest.ContainsKey($e.Name)) { $lv = $latest[$e.Name].Version }
+        $state = 'unknown'
+        if ($lv) { $state = Get-AppVersionState -Installed $r.Version -Latest $lv }
+        $versions.Add([pscustomobject]@{
+            State = $state; App = $e.Name; Version = $r.Version; Latest = $lv; DeviceCount = $r.DeviceCount
+            DetectedId = $r.Id; DetectedName = $r.Name; Publisher = $r.Publisher
+        })
+        switch ($state) {
+            'ok'    { $res.InstallsOk    += $r.DeviceCount }
+            'minor' { $res.InstallsMinor += $r.DeviceCount }
+            'major' { $res.InstallsMajor += $r.DeviceCount }
+            default { $res.InstallsUnknown += $r.DeviceCount }
+        }
+    }
+    $res.Versions = @($versions | Sort-Object @{ Expression = { $AppUpdateStatusRank[$_.State] }; Descending = $true },
+                                              @{ Expression = { $_.App } },
+                                              @{ Expression = { $_.DeviceCount }; Descending = $true })
+
+    # 6. Synthèse par application : statut = pire retard constaté (versions illisibles ignorées)
+    $summary = foreach ($g in @($versions | Group-Object App)) {
+        $rows = @($g.Group)
+        $l    = $null
+        if ($latest.ContainsKey($g.Name)) { $l = $latest[$g.Name] }
+        $cnt  = @{ ok = 0; minor = 0; major = 0; unknown = 0 }
+        foreach ($v in $rows) { $cnt[$v.State] += $v.DeviceCount }
+        $state = 'unknown'
+        if ($l -and $l.Version) {
+            if     ($cnt.major -gt 0) { $state = 'major' }
+            elseif ($cnt.minor -gt 0) { $state = 'minor' }
+            elseif ($cnt.ok -gt 0)    { $state = 'ok' }
+        }
+        $top = $rows | Sort-Object DeviceCount -Descending | Select-Object -First 1
+        [pscustomobject]@{
+            State        = $state
+            App          = $g.Name
+            Latest       = $(if ($l) { $l.Version } else { $null })
+            Source       = $(if ($l -and $l.Version) { if ($l.FromCache) { "$($l.Source) (cache)" } else { $l.Source } } else { "" })
+            CheckedUtc   = $(if ($l) { $l.CheckedUtc } else { $null })
+            Error        = $(if ($l) { $l.Error } else { $null })
+            Total        = ($cnt.ok + $cnt.minor + $cnt.major + $cnt.unknown)
+            Ok           = $cnt.ok
+            Minor        = $cnt.minor
+            Major        = $cnt.major
+            Unknown      = $cnt.unknown
+            PctOk        = (Get-IxPercent $cnt.ok ($cnt.ok + $cnt.minor + $cnt.major))
+            VersionCount = @($rows | ForEach-Object { $_.Version } | Select-Object -Unique).Count
+            TopVersion   = $top.Version
+        }
+    }
+    $res.Summary    = @($summary | Where-Object { $null -ne $_ } | Sort-Object @{ Expression = { $AppUpdateStatusRank[$_.State] }; Descending = $true },
+                                               @{ Expression = { $_.Major + $_.Minor }; Descending = $true },
+                                               @{ Expression = { $_.App } })
+    $res.AppsBehind = @($res.Summary | Where-Object { $_.State -in @('major', 'minor') }).Count
+
+    # 7. Postes à mettre à jour (versions en retard, les plus répandues d'abord)
+    if ($ListDevices) {
+        $behind = @($versions | Where-Object { $_.State -in @('major', 'minor') } |
+                    Sort-Object @{ Expression = { $AppUpdateStatusRank[$_.State] }; Descending = $true }, @{ Expression = { $_.DeviceCount }; Descending = $true })
+        $lookup = $behind
+        if ($behind.Count -gt $AppUpdateMaxDeviceLookups) {
+            $lookup = @($behind[0..($AppUpdateMaxDeviceLookups - 1)])
+            $Warnings.Add("Postes à mettre à jour : liste limitée aux $AppUpdateMaxDeviceLookups versions en retard les plus répandues, sur $($behind.Count) (`$AppUpdateMaxDeviceLookups).")
+        }
+        if ($lookup.Count -gt 0) {
+            Write-Step "🔎 Postes à mettre à jour : $($lookup.Count) version(s) en retard..."
+            $devMap = Get-DetectedAppDeviceIds -DetectedAppIds @($lookup | ForEach-Object { $_.DetectedId }) -AccessToken $AccessToken -Warnings $Warnings
+            $byId   = @{}
+            foreach ($d in @($ScopeDevices)) { if ($d -and $d.Id) { $byId[[string]$d.Id] = $d } }
+            $nowUtc  = [datetime]::UtcNow
+            $devRows = [System.Collections.Generic.List[object]]::new()
+            $listed  = [System.Collections.Generic.HashSet[string]]::new()
+            foreach ($v in $lookup) {
+                foreach ($devId in @($devMap[$v.DetectedId])) {
+                    # Postes hors périmètre (VM exclues, supprimés) : ignorés, comme sur la page Santé
+                    if (-not $devId -or -not $byId.ContainsKey([string]$devId)) { continue }
+                    $d    = $byId[[string]$devId]
+                    $name = $d.DeviceName
+                    $upn  = $d.UserPrincipalName
+                    if ($AnonymizeData) {
+                        $anon = Get-AnonymizedIdentity -RealName $name -RealUpn $upn
+                        $name = $anon.Name
+                        $upn  = $anon.Upn
+                    }
+                    $days = $null
+                    if ($d.LastSyncDateTime) { $days = [int][math]::Floor(($nowUtc - $d.LastSyncDateTime).TotalDays) }
+                    [void]$listed.Add([string]$devId)
+                    $devRows.Add([pscustomobject]@{
+                        State = $v.State; App = $v.App; Version = $v.Version; Latest = $v.Latest
+                        DeviceName = $name; UserPrincipalName = $upn; LastSyncDateTime = $d.LastSyncDateTime; DaysSinceSync = $days
+                    })
+                }
+            }
+            $res.Devices = @($devRows | Sort-Object @{ Expression = { $AppUpdateStatusRank[$_.State] }; Descending = $true },
+                                                    @{ Expression = { $_.App } }, @{ Expression = { $_.DeviceName } })
+            $res.DevicesListed = $listed.Count
+        }
+    }
+
+    # 8. Packages Intune face à la dernière version de l'éditeur
+    $pkgRows = foreach ($p in $packageMatches) {
+        $lv = $null
+        if ($latest.ContainsKey($p.Entry.Name)) { $lv = $latest[$p.Entry.Name].Version }
+        $pv    = "$($p.App.Version)".Trim()
+        $state = 'unknown'
+        $note  = ""
+        if (-not $pv)     { $note = "Version non renseignée dans le package Intune" }
+        elseif (-not $lv) { $note = "Dernière version de l'éditeur inconnue" }
+        else {
+            $state = Get-AppVersionState -Installed $pv -Latest $lv
+            if ($state -eq 'unknown') { $note = "Version du package illisible" }
+        }
+        [pscustomobject]@{
+            State = $state; App = $p.Entry.Name; Package = $p.App.DisplayName; Type = $p.App.AppType
+            PackageVersion = $pv; Latest = $lv; Note = $note; CreatedDateTime = $p.App.CreatedDateTime
+        }
+    }
+    $res.Packages = @($pkgRows | Where-Object { $null -ne $_ } | Sort-Object @{ Expression = { $AppUpdateStatusRank[$_.State] }; Descending = $true }, @{ Expression = { $_.App } }, @{ Expression = { $_.Package } })
+    $res.PackagesBehind = @($res.Packages | Where-Object { $_.State -in @('major', 'minor') }).Count
+
+    $res.Success = $true
+    Write-Log ("Mises à jour des applications : {0} application(s) suivie(s) sur le parc, installations à jour {1} / retard mineur {2} / retard majeur {3} / non vérifiables {4} ; {5} package(s) Intune en retard." -f `
+               $res.TrackedCount, $res.InstallsOk, $res.InstallsMinor, $res.InstallsMajor, $res.InstallsUnknown, $res.PackagesBehind) -Level $(if ($res.InstallsMajor -gt 0) { 'WARN' } else { 'OK' })
+    return $res
+}
+
+# --- Vues (tableaux HTML et CSV, colonnes en français) ---
+
+function Select-AppUpdateSummaryView {
+    param([object[]]$Rows)
+    foreach ($r in @($Rows)) {
+        if ($null -eq $r) { continue }
+        [pscustomobject][ordered]@{
+            'Statut'                   = $AppUpdateStatusLabels[$r.State]
+            'Application'              = $r.App
+            'Dernière version'         = $r.Latest
+            'Postes équipés'           = $r.Total
+            'À jour'                   = $r.Ok
+            'Retard mineur'            = $r.Minor
+            'Retard majeur'            = $r.Major
+            'Non vérifiables'          = $r.Unknown
+            '% à jour'                 = $r.PctOk
+            'Versions différentes'     = $r.VersionCount
+            'Version la plus répandue' = $r.TopVersion
+            'Source'                   = $(if ($r.Latest) { $r.Source } else { "Inconnue : $($r.Error)" })
+            'Vérifiée le'              = Format-LocalDate $r.CheckedUtc
+        }
+    }
+}
+
+function Select-AppUpdateVersionView {
+    param([object[]]$Rows)
+    foreach ($r in @($Rows)) {
+        if ($null -eq $r) { continue }
+        [pscustomobject][ordered]@{
+            'Statut'            = $AppUpdateStatusLabels[$r.State]
+            'Application'       = $r.App
+            'Version installée' = $r.Version
+            'Dernière version'  = $r.Latest
+            'Postes'            = $r.DeviceCount
+            'Nom dans Intune'   = $r.DetectedName
+            'Éditeur'           = $r.Publisher
+        }
+    }
+}
+
+function Select-AppUpdateDeviceView {
+    param([object[]]$Rows)
+    foreach ($r in @($Rows)) {
+        if ($null -eq $r) { continue }
+        [pscustomobject][ordered]@{
+            'Statut'             = $AppUpdateStatusLabels[$r.State]
+            'Application'        = $r.App
+            'Version installée'  = $r.Version
+            'Dernière version'   = $r.Latest
+            'Poste'              = $r.DeviceName
+            'Utilisateur (UPN)'  = $r.UserPrincipalName
+            'Dernière synchro'   = Format-LocalDate $r.LastSyncDateTime
+            'Jours sans synchro' = $r.DaysSinceSync
+        }
+    }
+}
+
+function Select-AppUpdatePackageView {
+    param([object[]]$Rows)
+    foreach ($r in @($Rows)) {
+        if ($null -eq $r) { continue }
+        [pscustomobject][ordered]@{
+            'Statut'             = $AppUpdateStatusLabels[$r.State]
+            'Application suivie' = $r.App
+            'Package Intune'     = $r.Package
+            'Type'               = $r.Type
+            'Version du package' = $r.PackageVersion
+            'Dernière version'   = $r.Latest
+            'Remarque'           = $r.Note
+            'Créé le'            = Format-LocalDate $r.CreatedDateTime
+        }
+    }
+}
+
+# Bloc d'en-tête de la partie "Mises à jour des applications" : KPI, lecture, avertissements
+function New-AppUpdateHeadHtml {
+    param([object]$Result, [System.Collections.Generic.List[string]]$Warnings)
+
+    $esc = { param($Text) ((ConvertTo-HtmlSafe $Text) -replace '\[', '&#91;') -replace '\]', '&#93;' }
+    $warnHtml = ""
+    if ($Warnings -and $Warnings.Count -gt 0) {
+        $items    = ($Warnings | ForEach-Object { "<li>$(& $esc $_)</li>" }) -join ''
+        $warnHtml = "<div class=`"ix-root ix-note ix-note--warn`">$(Get-IconSvg -Name 'alert' -Size 18)<div><strong>Données partiellement disponibles</strong><ul>$items</ul></div></div>"
+    }
+    if (-not $Result -or -not $Result.Success) {
+        $why = "Analyse non exécutée."
+        if ($Result -and $Result.Error) { $why = & $esc $Result.Error }
+        return (New-IxEmptyState -Icon 'package' -Tone 'danger' -Title "Inventaire des applications indisponible" -Text $why) + $warnHtml
+    }
+
+    $checked = $Result.InstallsOk + $Result.InstallsMinor + $Result.InstallsMajor
+    $pctOk   = if ($checked -gt 0) { "$(Get-IxPercent $Result.InstallsOk $checked) %" } else { "&mdash;" }
+    $cards   = [System.Text.StringBuilder]::new()
+    [void]$cards.Append((New-IxStatCard -Label 'Applications suivies' -Value $Result.TrackedCount -Icon 'package' -Color $Colors.Secondary -Caption "présentes sur le parc, sur $($Result.CatalogCount) au catalogue"))
+    [void]$cards.Append((New-IxStatCard -Label 'Installations à jour' -Value $pctOk -Icon 'shield-ok' -Color $Colors.Success -Caption "<b>$($Result.InstallsOk)</b> sur $checked installation(s) vérifiée(s)"))
+    [void]$cards.Append((New-IxStatCard -Label 'Retard de version majeure' -Value $Result.InstallsMajor -Icon 'x-circle' -Color $Colors.Danger -Caption "installation(s) - poste qui ne se met plus à jour"))
+    [void]$cards.Append((New-IxStatCard -Label 'Mise à jour mineure en attente' -Value $Result.InstallsMinor -Icon 'alert' -Color $Colors.Warning -Caption "installation(s) - correctif ou version mineure"))
+    [void]$cards.Append((New-IxStatCard -Label 'Packages Intune en retard' -Value $Result.PackagesBehind -Icon 'refresh' -Color $Colors.Accent -Caption "Win32 / MSI plus anciens que la version éditeur"))
+    [void]$cards.Append((New-IxStatCard -Label 'Logiciels inventoriés' -Value $Result.InventoryCount -Icon 'database' -Color $Colors.Primary -Caption "applications découvertes distinctes"))
+
+    $online = if ($Result.Online) { "lues en ligne lors de la génération (cache de $AppUpdateCacheHours h)" } else { "reprises du cache local (recherche en ligne désactivée)" }
+    $note = "<div class=`"ix-root ix-note`">$(Get-IconSvg -Name 'info' -Size 18)<div><strong>Lecture :</strong> " +
+            "les versions installées viennent de l'inventaire Intune « Applications découvertes » (postes d'entreprise, actualisé environ tous les 7 jours : " +
+            "un poste mis à jour récemment peut encore apparaître dans son ancienne version). Les dernières versions sont $online, " +
+            "auprès des sources officielles des éditeurs, de GitHub ou de winget ; pour Chrome, c'est la version que Google sert à au moins " +
+            "$([int]($AppUpdateChromeMinFraction * 100)) % des postes (déploiement progressif). Les navigateurs se mettent à jour seuls : un retard mineur de quelques jours est normal, " +
+            "un retard de version majeure signale un poste qui ne se met plus à jour. Les nombres de postes par version couvrent tout le tenant ; " +
+            "la liste nominative suit le périmètre analysé. Applications suivies et sources modifiables en tête de script (`$AppUpdateCatalog).</div></div>"
+
+    return "<div class=`"ix-root ix-overview`">$($cards.ToString())</div>" + $note + $warnHtml
+}
+
+# Applications du catalogue cochées dans l'onglet "Applications" (toutes hors interface)
+function Get-SelectedAppCatalog {
+    if (-not $clbAppCatalog) { return @($AppUpdateCatalog) }
+    $selected = for ($i = 0; $i -lt @($AppUpdateCatalog).Count; $i++) {
+        if ($clbAppCatalog.GetItemChecked($i)) { $AppUpdateCatalog[$i] }
+    }
+    return @($selected)
+}
+
+# ========================================
 # [v4.0] EXPORTS CSV (TOUTES LES SECTIONS)
 # ========================================
 # Un dossier horodaté par génération, un fichier par jeu de données collecté.
@@ -3578,7 +4606,10 @@ function Install-RequiredModules {
 
 # [v4.0] Texte des avertissements de la génération (message de fin et journal)
 function Get-RunWarningsText {
-    param([object]$NcResult, [System.Collections.Generic.List[string]]$RunWarnings, [System.Collections.Generic.List[string]]$HealthWarnings)
+    param(
+        [object]$NcResult, [System.Collections.Generic.List[string]]$RunWarnings, [System.Collections.Generic.List[string]]$HealthWarnings,
+        [System.Collections.Generic.List[string]]$AppWarnings
+    )
     $text = ""
     if ($NcResult -and -not $NcResult.Success) {
         $text += "`n`n⚠ Analyse des non-conformités indisponible :`n$($NcResult.Error)"
@@ -3587,6 +4618,10 @@ function Get-RunWarningsText {
     }
     if ($HealthWarnings -and $HealthWarnings.Count -gt 0) {
         $text += "`n`n⚠ Santé des postes ($($HealthWarnings.Count) source(s) partiellement disponible(s)) :`n- " + ($HealthWarnings -join "`n- ")
+    }
+    # [v4.1] Sources de versions muettes, inventaire indisponible, liste de postes limitée...
+    if ($AppWarnings -and $AppWarnings.Count -gt 0) {
+        $text += "`n`n⚠ Mises à jour des applications ($($AppWarnings.Count) avertissement(s)) :`n- " + ($AppWarnings -join "`n- ")
     }
     if ($RunWarnings -and $RunWarnings.Count -gt 0) {
         $text += "`n`n⚠ Autres avertissements :`n- " + ($RunWarnings -join "`n- ")
@@ -3630,12 +4665,16 @@ function Generate-Dashboard {
     $RunHealth          = $ActiveHealthChecks -gt 0
     $RunWarnings        = [System.Collections.Generic.List[string]]::new()
     $HealthWarnings     = [System.Collections.Generic.List[string]]::new()
+    # [v4.1] Mises à jour des applications : case maître (Contenu) + options (onglet Applications)
+    $RunAppUpdates      = $chkAppUpdates.Checked
+    $AppCatalogItems    = @(Get-SelectedAppCatalog)
+    $AppWarnings        = [System.Collections.Generic.List[string]]::new()
     Reset-AnonymizationMaps
 
     $lblStatus.ForeColor = [System.Drawing.Color]::FromArgb(0, 120, 212)
     Write-Step "⏳ Génération pour $ClientName..."
     Write-Log "================================================================"
-    Write-Log "NOUVELLE GÉNÉRATION - Client : $ClientName - HTML=$GenerateHtml / CSV=$ExportCsv / Santé=$ActiveHealthChecks vérification(s) / Parallèle=$($chkParallel.Checked)"
+    Write-Log "NOUVELLE GÉNÉRATION - Client : $ClientName - HTML=$GenerateHtml / CSV=$ExportCsv / Santé=$ActiveHealthChecks vérification(s) / Parallèle=$($chkParallel.Checked) / MAJ applications=$RunAppUpdates ($($AppCatalogItems.Count) suivie(s), en ligne=$($chkAppOnline.Checked))"
 
     try {
         if ($GenerateHtml) {
@@ -3701,7 +4740,9 @@ function Generate-Dashboard {
         if ($chkInactive180.Checked) { [void]$InactiveThresholds.Add(180) }
 
         # ===== APPLICATIONS =====
-        if ($chkApplications.Checked) {
+        # [v4.1] Lues aussi pour les mises à jour d'applications (versions des packages Win32 / MSI)
+        $ManagedApps = @()
+        if ($chkApplications.Checked -or $RunAppUpdates) {
             Write-Step "📱 Récupération des applications..."
             try {
                 $ManagedApps = @(Get-MobileAppsRest -AccessToken $AccessToken)
@@ -3851,6 +4892,17 @@ function Generate-Dashboard {
             $AppsForFailedDonut = @(if ($LatestFailedAppsTop10.Count -gt 0) { $LatestFailedAppsTop10 } else { $FailedAppsTop10 })
         }
 
+        # ===== [v4.1] MISES À JOUR DES APPLICATIONS =====
+        # Inventaire Intune (versions installées) face aux dernières versions publiées par
+        # les éditeurs (Internet, cache local). Gère ses propres erreurs : un échec devient
+        # un avertissement de la page, jamais un arrêt de la génération.
+        $AppUpdateResult = $null
+        if ($RunAppUpdates) {
+            $AppUpdateResult = Invoke-AppUpdateAnalysis -ScopeDevices $DevicesScope -ManagedApps $ManagedApps -Catalog $AppCatalogItems `
+                                   -Online $chkAppOnline.Checked -UseWinget $chkAppWinget.Checked -UseCache $chkAppUseCache.Checked `
+                                   -ListDevices $chkAppDeviceList.Checked -AccessToken $AccessToken -AnonymizeData $AnonymizeData -Warnings $AppWarnings
+        }
+
         # ===== [v4.0] PROFILS DE CONFIGURATION (Update Rings + vérification "profils") =====
         $DeviceConfigurations = @()
         if ($chkUpdateRings.Checked -or $HealthChecks.ConfigProfile) {
@@ -3930,8 +4982,9 @@ function Generate-Dashboard {
 
         # ===== APPLICATIONS - TABLE =====
         if ($chkApplications.Checked) {
+            # [v4.1] + type et version publiée de chaque application
             $ManagedAppTable = $ManagedApps |
-                Select-Object DisplayName, Publisher, Id, CreatedDateTime |
+                Select-Object DisplayName, Publisher, AppType, Version, Id, CreatedDateTime |
                 Sort-Object -Descending CreatedDateTime
         }
 
@@ -3976,6 +5029,14 @@ function Generate-Dashboard {
                 $Datasets["13_Sante_Actions_Postes"]   = @(Select-HealthActionDetailView -Actions $HealthData.Actions)
                 $Datasets["14_Sante_Espace_Disque"]    = @(Select-HealthDiskView -Rows $HealthData.Rows)
             }
+            # [v4.1] Mises à jour des applications (inventaire complet en dernier : le plus volumineux)
+            if ($AppUpdateResult -and $AppUpdateResult.Success) {
+                $Datasets["16_Apps_MAJ_Synthese"]        = @(Select-AppUpdateSummaryView -Rows $AppUpdateResult.Summary)
+                $Datasets["17_Apps_MAJ_Versions"]        = @(Select-AppUpdateVersionView -Rows $AppUpdateResult.Versions)
+                $Datasets["18_Apps_MAJ_Postes"]          = @(Select-AppUpdateDeviceView -Rows $AppUpdateResult.Devices)
+                $Datasets["19_Apps_MAJ_Packages_Intune"] = @(Select-AppUpdatePackageView -Rows $AppUpdateResult.Packages)
+                $Datasets["20_Apps_Inventaire"]          = @($AppUpdateResult.Inventory)
+            }
             foreach ($days in $InactiveThresholds) {
                 $Datasets[("15_Inactifs_{0:000}j" -f $days)] = @($InactiveDevicesByThreshold["$days"] | Select-Object DeviceName, UserPrincipalName, OperatingSystem, Manufacturer, Model, OSVersion, ComplianceState, IsEncrypted, LastSyncDateTime, EnrolledDateTime)
             }
@@ -3990,7 +5051,7 @@ function Generate-Dashboard {
             if ($ExportFiles.Count -gt 0) { $message += "`n`n$($ExportFiles.Count) fichier(s) CSV :`n$ExportFolder" }
             else                          { $message += "`n`nAucun fichier CSV n'a pu être écrit (voir les avertissements)." }
             if ($OpenAfterGeneration -and $ExportFiles.Count -gt 0) { $message += "`n`nLe dossier des exports s'ouvre automatiquement." }
-            $warnText = Get-RunWarningsText -NcResult $NcResult -RunWarnings $RunWarnings -HealthWarnings $HealthWarnings
+            $warnText = Get-RunWarningsText -NcResult $NcResult -RunWarnings $RunWarnings -HealthWarnings $HealthWarnings -AppWarnings $AppWarnings
             if ($warnText) { Write-Log ($warnText.Trim()) -Level WARN }
             Write-Log "SUCCÈS (sans HTML) - $($ExportFiles.Count) fichier(s) CSV dans $ExportFolder" -Level OK
             Show-InfoMessage ($message + $warnText)
@@ -4105,6 +5166,10 @@ $ContactHtml
             $HealthActions  = @(Get-HealthActionSummary -Actions $HealthData.Actions)
         }
 
+        # --- [v4.1] Mises à jour des applications : KPI, lecture, avertissements ---
+        $AppUpdateHeadHtml = ""
+        if ($RunAppUpdates) { $AppUpdateHeadHtml = New-AppUpdateHeadHtml -Result $AppUpdateResult -Warnings $AppWarnings }
+
         # --- Update Rings : cartes avec taux de succès, barre de répartition et métriques ---
         $RingsHtml = ""
         if ($chkUpdateRings.Checked -and $UpdateRingsSummary.Count -gt 0) {
@@ -4182,14 +5247,14 @@ $ContactHtml
         # des sections qu'elle regroupe est cochée dans l'interface.
         # ============================================================
         $HasSecurity = $chkCompliance.Checked -or $chkEncryption.Checked -or $chkNcAnalysis.Checked
-        $HasDeploy   = $chkUpdateRings.Checked -or $chkApplications.Checked
+        $HasDeploy   = $chkUpdateRings.Checked -or $chkApplications.Checked -or $RunAppUpdates
         # [v4.0] "Santé & proactivité" absorbe "Optimisation du parc" (inactifs + disque)
         $HasSante    = ($InactiveThresholds.Count -gt 0) -or [bool]$HealthData
 
         $IxPages = [System.Collections.Generic.List[object]]::new()
         $IxPages.Add([PSCustomObject]@{ Id = 'vue-ensemble'; Icon = 'layout'; Label = "Vue d'ensemble"; Hint = 'Taille et composition du parc : plateformes, modèles et versions de Windows' })
         if ($HasSecurity) { $IxPages.Add([PSCustomObject]@{ Id = 'securite';     Icon = 'shield';  Label = 'Sécurité & conformité';       Hint = 'Conformité Intune, raisons de non-conformité et chiffrement BitLocker' }) }
-        if ($HasDeploy)   { $IxPages.Add([PSCustomObject]@{ Id = 'deploiement';  Icon = 'package'; Label = 'Mises à jour & applications'; Hint = 'Windows Update Rings et déploiement des applications' }) }
+        if ($HasDeploy)   { $IxPages.Add([PSCustomObject]@{ Id = 'deploiement';  Icon = 'package'; Label = 'Mises à jour & applications'; Hint = 'Windows Update Rings, déploiement des applications et versions du parc face aux dernières versions des éditeurs' }) }
         if ($HasSante)    { $IxPages.Add([PSCustomObject]@{ Id = 'sante';        Icon = 'gauge';   Label = 'Santé & proactivité';         Hint = 'Endpoint Analytics, disque, démarrage, écrans bleus, batteries, inactivité et actions de remédiation' }) }
 
         $IxPage = @{}
@@ -4484,6 +5549,69 @@ $ContactHtml
                     }
                 }
 
+                # [v4.1] MISES À JOUR DES APPLICATIONS — versions du parc face aux dernières
+                # versions publiées par les éditeurs (synthèse, détail, postes, packages, inventaire)
+                if ($RunAppUpdates) {
+                    New-HTMLSection -HeaderText "Application Updates (Latest Versions)" -HeaderTextSize 14 -HeaderBackGroundColor $Colors.AppUpdates -CanCollapse {
+                        New-HTMLPanel {
+                            New-HTMLText -Text $AppUpdateHeadHtml -FontSize 1
+                        }
+                    }
+
+                    if ($AppUpdateResult -and $AppUpdateResult.Success -and $AppUpdateResult.Summary.Count -gt 0) {
+                        $AppBehindTop = @($AppUpdateResult.Summary | Where-Object { ($_.Major + $_.Minor) -gt 0 } |
+                                          Sort-Object @{ Expression = { $_.Major + $_.Minor }; Descending = $true } | Select-Object -First 10)
+                        New-HTMLSection -Height 380 -HeaderText "Application Updates - Overview" -HeaderTextSize 14 -HeaderBackGroundColor $Colors.AppUpdates -CanCollapse {
+                            New-HTMLPanel {
+                                New-HTMLChart -Gradient {
+                                    New-ChartDonut -Name "À jour"         -Value $AppUpdateResult.InstallsOk    -Color $Colors.Success
+                                    New-ChartDonut -Name "Retard mineur"  -Value $AppUpdateResult.InstallsMinor -Color $Colors.Warning
+                                    New-ChartDonut -Name "Retard majeur"  -Value $AppUpdateResult.InstallsMajor -Color $Colors.Danger
+                                    if ($AppUpdateResult.InstallsUnknown -gt 0) {
+                                        New-ChartDonut -Name "Non vérifiable" -Value $AppUpdateResult.InstallsUnknown -Color "#94a3b8"
+                                    }
+                                } -Title "Installations des applications suivies" -TitleAlignment center -TitleColor $Colors.Primary
+                            }
+                            New-HTMLPanel {
+                                if ($AppBehindTop.Count -gt 0) {
+                                    New-HTMLChart -Gradient {
+                                        foreach ($appBehind in $AppBehindTop) { New-ChartBar -Name $appBehind.App -Value ($appBehind.Major + $appBehind.Minor) }
+                                        New-ChartLegend -Name "Installations à mettre à jour"
+                                    } -Title "Top 10 des applications à mettre à jour" -TitleAlignment center -TitleColor $Colors.Primary
+                                } else {
+                                    New-HTMLText -Text (New-IxEmptyState -Icon 'check' -Tone 'success' -Title "Parc à jour" -Text "Toutes les installations vérifiées sont dans la dernière version publiée par l'éditeur.") -FontSize 1
+                                }
+                            }
+                        }
+
+                        New-HTMLSection -HeaderText "Tracked Applications (Summary)" -HeaderTextSize 14 -HeaderBackGroundColor $Colors.DetailTables -CanCollapse {
+                            New-HTMLTable -DataTable @(Select-AppUpdateSummaryView -Rows $AppUpdateResult.Summary) -Filtering -PagingLength 25
+                        }
+
+                        New-HTMLSection -HeaderText "Installed Versions (Detail)" -HeaderTextSize 14 -HeaderBackGroundColor $Colors.DetailTables -CanCollapse -Collapsed {
+                            New-HTMLTable -DataTable @(Select-AppUpdateVersionView -Rows $AppUpdateResult.Versions) -Filtering -PagingLength 50
+                        }
+
+                        if ($AppUpdateResult.Devices.Count -gt 0) {
+                            New-HTMLSection -HeaderText "Devices to Update ($($AppUpdateResult.DevicesListed) devices)" -HeaderTextSize 14 -HeaderBackGroundColor $Colors.DetailTables -CanCollapse -Collapsed {
+                                New-HTMLTable -DataTable @(Select-AppUpdateDeviceView -Rows $AppUpdateResult.Devices) -Filtering -PagingLength 50
+                            }
+                        }
+                    }
+
+                    if ($AppUpdateResult -and $AppUpdateResult.Packages.Count -gt 0) {
+                        New-HTMLSection -HeaderText "Intune Packages vs Latest Versions" -HeaderTextSize 14 -HeaderBackGroundColor $Colors.DetailTables -CanCollapse -Collapsed {
+                            New-HTMLTable -DataTable @(Select-AppUpdatePackageView -Rows $AppUpdateResult.Packages) -Filtering -PagingLength 25
+                        }
+                    }
+
+                    if ($AppUpdateResult -and $AppUpdateResult.Inventory.Count -gt 0) {
+                        New-HTMLSection -HeaderText "Discovered Apps Inventory ($($AppUpdateResult.InventoryCount) apps)" -HeaderTextSize 14 -HeaderBackGroundColor $Colors.DetailTables -CanCollapse -Collapsed {
+                            New-HTMLTable -DataTable $AppUpdateResult.Inventory -Filtering -PagingLength 50
+                        }
+                    }
+                }
+
                 '</div>'
             }
 
@@ -4589,7 +5717,7 @@ $ContactHtml
         if ($NcResult -and -not $NcResult.Success) {
             $lblStatus.Text = "⚠ Dashboard généré - analyse des non-conformités indisponible"; $lblStatus.ForeColor = [System.Drawing.Color]::DarkOrange
         }
-        $warnText = Get-RunWarningsText -NcResult $NcResult -RunWarnings $RunWarnings -HealthWarnings $HealthWarnings
+        $warnText = Get-RunWarningsText -NcResult $NcResult -RunWarnings $RunWarnings -HealthWarnings $HealthWarnings -AppWarnings $AppWarnings
         if ($warnText) { Write-Log ($warnText.Trim()) -Level WARN }
         Write-Log "SUCCÈS - Rapport : $OutputFolder\$ReportFileName" -Level OK
         Show-InfoMessage ($message + $warnText)
@@ -4611,7 +5739,7 @@ $ContactHtml
 # ========================================
 
 $form = New-Object System.Windows.Forms.Form
-$form.Text            = "Intune Dashboard v4.0 - All-In-One"
+$form.Text            = "Intune Dashboard v4.1 - All-In-One"
 $form.Size            = New-Object System.Drawing.Size(980, 700)
 $form.StartPosition   = "CenterScreen"
 $form.FormBorderStyle = "FixedDialog"
@@ -4640,7 +5768,7 @@ $form.Controls.Add($headerPanel)
 $lblTitle           = New-Object System.Windows.Forms.Label
 $lblTitle.Location  = New-Object System.Drawing.Point(30, 20)
 $lblTitle.Size      = New-Object System.Drawing.Size(900, 50)
-$lblTitle.Text      = "Intune Dashboard  —  v4.0 All-In-One"
+$lblTitle.Text      = "Intune Dashboard  —  v4.1 All-In-One"
 $lblTitle.Font      = New-Object System.Drawing.Font("Segoe UI", 18, [System.Drawing.FontStyle]::Bold)
 $lblTitle.ForeColor = [System.Drawing.Color]::White
 $lblTitle.BackColor = [System.Drawing.Color]::Transparent
@@ -4825,7 +5953,7 @@ $tabContent.Controls.Add($lblContentInfo)
 # Sections principales
 $grpMainSections          = New-Object System.Windows.Forms.GroupBox
 $grpMainSections.Location = New-Object System.Drawing.Point(30, 48)
-$grpMainSections.Size     = New-Object System.Drawing.Size(430, 220)
+$grpMainSections.Size     = New-Object System.Drawing.Size(430, 252)
 $grpMainSections.Text     = " Sections principales "
 $grpMainSections.Font     = New-Object System.Drawing.Font("Segoe UI", 10, [System.Drawing.FontStyle]::Bold)
 $tabContent.Controls.Add($grpMainSections)
@@ -4868,25 +5996,33 @@ $chkHealth.Text     = "Santé & proactivité des postes (Endpoint Analytics)"; $
 $chkHealth.Font     = New-Object System.Drawing.Font("Segoe UI", 9)
 $grpMainSections.Controls.Add($chkHealth)
 
+# [v4.1] Case maître des mises à jour d'applications (options et catalogue des applications
+# suivies dans l'onglet « Applications »)
+$chkAppUpdates          = New-Object System.Windows.Forms.CheckBox
+$chkAppUpdates.Location = New-Object System.Drawing.Point(20, 222); $chkAppUpdates.Size = New-Object System.Drawing.Size(390, 25)
+$chkAppUpdates.Text     = "Mises à jour des applications (versions des éditeurs)"; $chkAppUpdates.Checked = $true
+$chkAppUpdates.Font     = New-Object System.Drawing.Font("Segoe UI", 9)
+$grpMainSections.Controls.Add($chkAppUpdates)
+
 # Sections supplémentaires (vides - déplacées dans Affichage)
 $grpExtraSections          = New-Object System.Windows.Forms.GroupBox
 $grpExtraSections.Location = New-Object System.Drawing.Point(480, 48)
-$grpExtraSections.Size     = New-Object System.Drawing.Size(430, 220)
+$grpExtraSections.Size     = New-Object System.Drawing.Size(430, 252)
 $grpExtraSections.Text     = " Info "
 $grpExtraSections.Font     = New-Object System.Drawing.Font("Segoe UI", 10, [System.Drawing.FontStyle]::Bold)
 $tabContent.Controls.Add($grpExtraSections)
 
 $lblExtraInfo           = New-Object System.Windows.Forms.Label
 $lblExtraInfo.Location  = New-Object System.Drawing.Point(20, 35)
-$lblExtraInfo.Size      = New-Object System.Drawing.Size(395, 140)
-$lblExtraInfo.Text      = "Les plateformes et les paliers d'appareils inactifs se configurent dans l'onglet « Affichage ».`n`nLes 14 vérifications de santé (disque, Endpoint Analytics, batteries, BitLocker, Defender...) et la collecte parallèle se configurent dans l'onglet « Proactivité ».`n`nLa génération HTML et les exports CSV se règlent dans l'onglet « Configuration »."
+$lblExtraInfo.Size      = New-Object System.Drawing.Size(395, 205)
+$lblExtraInfo.Text      = "Les plateformes et les paliers d'appareils inactifs se configurent dans l'onglet « Affichage ».`n`nLes 14 vérifications de santé (disque, Endpoint Analytics, batteries, BitLocker, Defender...) et la collecte parallèle se configurent dans l'onglet « Proactivité ».`n`nLes applications suivies et la recherche des dernières versions sur Internet se configurent dans l'onglet « Applications ».`n`nLa génération HTML et les exports CSV se règlent dans l'onglet « Configuration »."
 $lblExtraInfo.Font      = New-Object System.Drawing.Font("Segoe UI", 9, [System.Drawing.FontStyle]::Italic)
 $lblExtraInfo.ForeColor = [System.Drawing.Color]::FromArgb(0, 120, 212)
 $grpExtraSections.Controls.Add($lblExtraInfo)
 
 # Boutons tout sélectionner / tout désélectionner
 $btnSelectAll           = New-Object System.Windows.Forms.Button
-$btnSelectAll.Location  = New-Object System.Drawing.Point(30, 280)
+$btnSelectAll.Location  = New-Object System.Drawing.Point(30, 312)
 $btnSelectAll.Size      = New-Object System.Drawing.Size(200, 35)
 $btnSelectAll.Text      = "Tout sélectionner"
 $btnSelectAll.Font      = New-Object System.Drawing.Font("Segoe UI", 9, [System.Drawing.FontStyle]::Bold)
@@ -4898,12 +6034,12 @@ $btnSelectAll.Add_Click({
     $chkCompliance.Checked   = $true; $chkEncryption.Checked  = $true
     $chkApplications.Checked = $true; $chkUpdateRings.Checked = $true
     $chkHardware.Checked     = $true; $chkNcAnalysis.Checked  = $true
-    $chkHealth.Checked       = $true
+    $chkHealth.Checked       = $true; $chkAppUpdates.Checked  = $true
 })
 $tabContent.Controls.Add($btnSelectAll)
 
 $btnDeselectAll           = New-Object System.Windows.Forms.Button
-$btnDeselectAll.Location  = New-Object System.Drawing.Point(245, 280)
+$btnDeselectAll.Location  = New-Object System.Drawing.Point(245, 312)
 $btnDeselectAll.Size      = New-Object System.Drawing.Size(200, 35)
 $btnDeselectAll.Text      = "Tout désélectionner"
 $btnDeselectAll.Font      = New-Object System.Drawing.Font("Segoe UI", 9, [System.Drawing.FontStyle]::Bold)
@@ -4915,14 +6051,14 @@ $btnDeselectAll.Add_Click({
     $chkCompliance.Checked   = $false; $chkEncryption.Checked  = $false
     $chkApplications.Checked = $false; $chkUpdateRings.Checked = $false
     $chkHardware.Checked     = $false; $chkNcAnalysis.Checked  = $false
-    $chkHealth.Checked       = $false
+    $chkHealth.Checked       = $false; $chkAppUpdates.Checked  = $false
 })
 $tabContent.Controls.Add($btnDeselectAll)
 
 # [v3.3] Analyse des non-conformités (page "Sécurité & conformité")
 $grpNonCompliance          = New-Object System.Windows.Forms.GroupBox
-$grpNonCompliance.Location = New-Object System.Drawing.Point(30, 330)
-$grpNonCompliance.Size     = New-Object System.Drawing.Size(880, 95)
+$grpNonCompliance.Location = New-Object System.Drawing.Point(30, 360)
+$grpNonCompliance.Size     = New-Object System.Drawing.Size(880, 92)
 $grpNonCompliance.Text     = " Sécurité & conformité — analyse des non-conformités (API Graph) "
 $grpNonCompliance.Font     = New-Object System.Drawing.Font("Segoe UI", 10, [System.Drawing.FontStyle]::Bold)
 $tabContent.Controls.Add($grpNonCompliance)
@@ -5159,6 +6295,117 @@ $chkHealth.Add_CheckedChanged({
     $grpHealthChecks.Enabled      = $chkHealth.Checked
     $btnSelectAllHealth.Enabled   = $chkHealth.Checked
     $btnDeselectAllHealth.Enabled = $chkHealth.Checked
+})
+
+# ========================================
+# [v4.1] ONGLET 6 : APPLICATIONS (mises à jour des applications)
+# ========================================
+# Options de la recherche des dernières versions et choix des applications suivies
+# (une ligne par entrée de $AppUpdateCatalog, dans le même ordre).
+
+$tabApps           = New-Object System.Windows.Forms.TabPage
+$tabApps.Text      = "Applications"
+$tabApps.BackColor = [System.Drawing.Color]::White
+$tabControl.Controls.Add($tabApps)
+
+$grpAppOptions          = New-Object System.Windows.Forms.GroupBox
+$grpAppOptions.Location = New-Object System.Drawing.Point(30, 15)
+$grpAppOptions.Size     = New-Object System.Drawing.Size(880, 150)
+$grpAppOptions.Text     = " Mises à jour des applications — recherche des dernières versions "
+$grpAppOptions.Font     = New-Object System.Drawing.Font("Segoe UI", 10, [System.Drawing.FontStyle]::Bold)
+$tabApps.Controls.Add($grpAppOptions)
+
+$chkAppOnline          = New-Object System.Windows.Forms.CheckBox
+$chkAppOnline.Location = New-Object System.Drawing.Point(20, 28); $chkAppOnline.Size = New-Object System.Drawing.Size(840, 25)
+$chkAppOnline.Text     = "🌐  Rechercher les dernières versions sur Internet (API Google et Microsoft, sites des éditeurs, GitHub)"; $chkAppOnline.Checked = $true
+$chkAppOnline.Font     = New-Object System.Drawing.Font("Segoe UI", 9)
+$grpAppOptions.Controls.Add($chkAppOnline)
+
+$chkAppWinget          = New-Object System.Windows.Forms.CheckBox
+$chkAppWinget.Location = New-Object System.Drawing.Point(20, 56); $chkAppWinget.Size = New-Object System.Drawing.Size(840, 25)
+$chkAppWinget.Text     = "📦  Utiliser winget : source des applications marquées « winget », et secours quand le site de l'éditeur ne répond pas"; $chkAppWinget.Checked = $true
+$chkAppWinget.Font     = New-Object System.Drawing.Font("Segoe UI", 9)
+$grpAppOptions.Controls.Add($chkAppWinget)
+
+$chkAppUseCache          = New-Object System.Windows.Forms.CheckBox
+$chkAppUseCache.Location = New-Object System.Drawing.Point(20, 84); $chkAppUseCache.Size = New-Object System.Drawing.Size(840, 25)
+$chkAppUseCache.Text     = "🗂  Réutiliser les versions trouvées depuis moins de $AppUpdateCacheHours h (décocher pour forcer une nouvelle recherche)"; $chkAppUseCache.Checked = $true
+$chkAppUseCache.Font     = New-Object System.Drawing.Font("Segoe UI", 9)
+$grpAppOptions.Controls.Add($chkAppUseCache)
+
+$chkAppDeviceList          = New-Object System.Windows.Forms.CheckBox
+$chkAppDeviceList.Location = New-Object System.Drawing.Point(20, 112); $chkAppDeviceList.Size = New-Object System.Drawing.Size(840, 25)
+$chkAppDeviceList.Text     = "🔎  Lister les postes à mettre à jour (appels Graph groupés par 20, $AppUpdateMaxDeviceLookups versions en retard au plus)"; $chkAppDeviceList.Checked = $true
+$chkAppDeviceList.Font     = New-Object System.Drawing.Font("Segoe UI", 9)
+$grpAppOptions.Controls.Add($chkAppDeviceList)
+
+# Sans recherche en ligne, le cache est toujours utilisé (quel que soit son âge)
+$chkAppOnline.Add_CheckedChanged({ $chkAppUseCache.Enabled = $chkAppOnline.Checked })
+
+$grpAppCatalog          = New-Object System.Windows.Forms.GroupBox
+$grpAppCatalog.Location = New-Object System.Drawing.Point(30, 175)
+$grpAppCatalog.Size     = New-Object System.Drawing.Size(880, 240)
+$grpAppCatalog.Text     = " Applications suivies (dernière version comparée au parc) "
+$grpAppCatalog.Font     = New-Object System.Drawing.Font("Segoe UI", 10, [System.Drawing.FontStyle]::Bold)
+$tabApps.Controls.Add($grpAppCatalog)
+
+$clbAppCatalog              = New-Object System.Windows.Forms.CheckedListBox
+$clbAppCatalog.Location     = New-Object System.Drawing.Point(20, 28)
+$clbAppCatalog.Size         = New-Object System.Drawing.Size(570, 200)
+$clbAppCatalog.Font         = New-Object System.Drawing.Font("Segoe UI", 9)
+$clbAppCatalog.CheckOnClick = $true
+$clbAppCatalog.MultiColumn  = $true
+$clbAppCatalog.ColumnWidth  = 280
+foreach ($catEntry in $AppUpdateCatalog) {
+    $catSource = switch ("$($catEntry.Source)") {
+        'Chrome' { "API Google" }
+        'Edge'   { "API Microsoft" }
+        'GitHub' { "GitHub" }
+        'Winget' { "winget" }
+        'Url'    { "site éditeur" }
+        default  { "$($catEntry.Source)" }
+    }
+    $catIndex = $clbAppCatalog.Items.Add("$($catEntry.Name)  ·  $catSource")
+    $clbAppCatalog.SetItemChecked($catIndex, $true)
+}
+$grpAppCatalog.Controls.Add($clbAppCatalog)
+
+$btnSelectAllApps           = New-Object System.Windows.Forms.Button
+$btnSelectAllApps.Location  = New-Object System.Drawing.Point(605, 28)
+$btnSelectAllApps.Size      = New-Object System.Drawing.Size(255, 32)
+$btnSelectAllApps.Text      = "Toutes les applications"
+$btnSelectAllApps.Font      = New-Object System.Drawing.Font("Segoe UI", 9, [System.Drawing.FontStyle]::Bold)
+$btnSelectAllApps.FlatStyle = "Flat"
+$btnSelectAllApps.BackColor = [System.Drawing.Color]::FromArgb(40, 167, 69)
+$btnSelectAllApps.ForeColor = [System.Drawing.Color]::White
+$btnSelectAllApps.Cursor    = [System.Windows.Forms.Cursors]::Hand
+$btnSelectAllApps.Add_Click({ for ($i = 0; $i -lt $clbAppCatalog.Items.Count; $i++) { $clbAppCatalog.SetItemChecked($i, $true) } })
+$grpAppCatalog.Controls.Add($btnSelectAllApps)
+
+$btnDeselectAllApps           = New-Object System.Windows.Forms.Button
+$btnDeselectAllApps.Location  = New-Object System.Drawing.Point(605, 66)
+$btnDeselectAllApps.Size      = New-Object System.Drawing.Size(255, 32)
+$btnDeselectAllApps.Text      = "Aucune (inventaire seul)"
+$btnDeselectAllApps.Font      = New-Object System.Drawing.Font("Segoe UI", 9, [System.Drawing.FontStyle]::Bold)
+$btnDeselectAllApps.FlatStyle = "Flat"
+$btnDeselectAllApps.BackColor = [System.Drawing.Color]::FromArgb(220, 53, 69)
+$btnDeselectAllApps.ForeColor = [System.Drawing.Color]::White
+$btnDeselectAllApps.Cursor    = [System.Windows.Forms.Cursors]::Hand
+$btnDeselectAllApps.Add_Click({ for ($i = 0; $i -lt $clbAppCatalog.Items.Count; $i++) { $clbAppCatalog.SetItemChecked($i, $false) } })
+$grpAppCatalog.Controls.Add($btnDeselectAllApps)
+
+$lblAppInfo           = New-Object System.Windows.Forms.Label
+$lblAppInfo.Location  = New-Object System.Drawing.Point(605, 106)
+$lblAppInfo.Size      = New-Object System.Drawing.Size(260, 128)
+$lblAppInfo.Text      = "Ajouter une application : une ligne dans `$AppUpdateCatalog en tête de script.`nInventaire Intune actualisé ~ tous les 7 jours (postes d'entreprise).`nAucune donnée du tenant n'est envoyée sur Internet.`nPermissions : DeviceManagementManagedDevices.Read.All, DeviceManagementApps.Read.All."
+$lblAppInfo.Font      = New-Object System.Drawing.Font("Segoe UI", 8, [System.Drawing.FontStyle]::Italic)
+$lblAppInfo.ForeColor = [System.Drawing.Color]::Gray
+$grpAppCatalog.Controls.Add($lblAppInfo)
+
+# La case maître (onglet Contenu) active ou grise toutes les options de l'onglet
+$chkAppUpdates.Add_CheckedChanged({
+    $grpAppOptions.Enabled = $chkAppUpdates.Checked
+    $grpAppCatalog.Enabled = $chkAppUpdates.Checked
 })
 
 # ========================================
