@@ -1,8 +1,19 @@
 ﻿# ============================================================
-# Script : Intune Global Dashboard Generator - v3.3 (analyse des non-conformités via l'API Graph)
-# Description : Génère un dashboard HTML interactif pour visualiser 
-#               l'état des appareils Intune (conformité, chiffrement, 
-#               applications, update rings, hardware)
+# Script : Intune Dashboard All-In-One - v4.0
+#          (socle "Script_Global_V3.3_Pages" + module "Proactivité / Santé des postes")
+# Description : Interroge Microsoft Graph (REST, sans module Microsoft.Graph) et
+#               génère, au choix, un dashboard HTML interactif (PSWriteHTML, pages
+#               à onglets collants) et/ou des exports CSV : conformité, chiffrement,
+#               applications, update rings, hardware, santé et proactivité des postes
+#
+# REPÈRES DE FUSION (rechercher ces balises dans le fichier) :
+#   [FUSION v4 - Proactivité] : logique reprise du script "Script_proactivité_V2"
+#                               (Endpoint Analytics, disque, démarrage, écrans bleus,
+#                               batteries, inactivité, BitLocker, Defender, mises à
+#                               jour, fiabilité applicative, profils, conformité)
+#   [v4.0]                    : nouveau code propre à la fusion (REST, throttling
+#                               partagé, $batch, HTML basculable, exports CSV...)
+#   [v3.x] / [MODIF v3] / [UI v3.x] : historique du socle V3.3, conservé
 # Nouveautés v2 : options plateformes, paliers inactifs configurables,
 #                 affichage Low Storage au choix
 # Nouveautés v3 : section "Non Encrypted" améliorée :
@@ -36,6 +47,20 @@
 #                   - appels Graph fiabilisés : nouvelles tentatives sur
 #                     429 / 5xx / erreur réseau (Retry-After, backoff),
 #                     renouvellement du jeton, messages d'erreur explicites
+# Nouveautés v4.0 (All-In-One) :
+#                   - nouvelle page "Santé & proactivité" (14 vérifications du
+#                     script Proactivité), qui absorbe "Optimisation du parc" :
+#                     paliers d'inactivité conservés, espace disque jugé en %
+#                   - collecte 100 % REST : plus de module Microsoft.Graph
+#                     (démarrage plus rapide, $select sur les appareils) ;
+#                     PSWriteHTML n'est chargé que si le HTML est demandé
+#                   - génération HTML désactivable : exécution des requêtes
+#                     Graph et exports CSV seuls (dossier horodaté)
+#                   - export CSV de toutes les sections collectées
+#                   - throttling Graph partagé entre flux parallèles (un 429 met
+#                     tous les flux en pause), Retry-After respecté, $batch pour
+#                     les appels par appareil, fenêtre réactive pendant les pauses
+#                   - journal C:\temp\dashboard-log.txt, pseudonymes stables
 # Auteur : ECONOCOM
 # ============================================================
 
@@ -43,9 +68,19 @@
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
+# ===== [FUSION v4 - Proactivité] RÉGLAGES RÉSEAU (.NET) =====
+# .NET Framework n'autorise que DEUX connexions HTTP simultanées vers un même hôte :
+# sans cette ligne, quatre flux de collecte parallèles n'en font travailler que deux.
+try { [System.Net.ServicePointManager]::DefaultConnectionLimit = 24 } catch { }
+# TLS 1.2 ajouté sans retirer ce qui est déjà négociable (TLS 1.3 sur les OS récents).
+try { [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor [System.Net.SecurityProtocolType]::Tls12 } catch { }
+
 # ===== CONFIGURATION GLOBALE =====
 $ConfigFolder = "C:\temp\clients-id"
 $OutputFolder = "C:\temp"
+# [FUSION v4 - Proactivité] Journal d'exécution (rotation à 5 Mo) : à joindre à toute
+# demande de diagnostic plutôt que des captures d'écran de la console.
+$LogFile      = "C:\temp\dashboard-log.txt"
 
 # ===== [MODIF v3] SEUIL D'INACTIVITÉ - SECTION "NON ENCRYPTED" =====
 # Nombre de jours sans synchronisation Intune au-delà duquel un poste est
@@ -80,12 +115,44 @@ $NcKeywordsHorsReseau = @(
 $NcUseBulkReport  = $true
 $NcReportPageSize = 500
 
-# Export CSV : séparateur ";" (Excel en français), encodage UTF-8 avec BOM
+# Export CSV (toutes sections) : séparateur ";" (Excel en français), UTF-8 avec BOM
 $NcCsvDelimiter = ";"
 
 # ===== [v3.3] RÉSILIENCE DES APPELS À L'API GRAPH =====
 $GraphMaxRetries        = 5     # nouvelles tentatives sur 429 / 5xx / erreur réseau
 $GraphRequestTimeoutSec = 120   # délai maximal d'une requête (secondes)
+
+# ===== [FUSION v4 - Proactivité] PERFORMANCE DE LA COLLECTE =====
+# Les listes Endpoint Analytics (scores, performances, batteries, fiabilité,
+# historique de démarrage) et BitLocker sont indépendantes : elles sont lues de
+# front dans un pool de runspaces. Au-delà de 4 à 6 flux, on déclenche le
+# throttling Graph et le gain se retourne en perte.
+# (Case "Collecte parallèle" de l'onglet Proactivité : décochée = séquentiel.)
+$MaxParallelCollections    = 4
+# Garde-fou de durée de la vérification "profils de configuration en erreur"
+$MaxConfigProfilesAnalyzed = 300
+
+# ===== [FUSION v4 - Proactivité] SEUILS DE LA PAGE "SANTÉ & PROACTIVITÉ" =====
+# Ajustez-les librement à votre contexte.
+$RemediationThresholds = @{
+    DiskFreePctCritical  = 10     # % d'espace libre en-dessous duquel c'est critique
+    DiskFreePctWarning   = 20     # % d'espace libre à surveiller
+    DiskFreeGbCritical   = 5      # critique aussi si moins de N Go libres, quel que soit le %
+    StaleDaysWarning     = 30     # jours sans synchronisation -> à surveiller
+    StaleDaysCritical    = 90     # jours sans synchronisation -> critique
+    ScoreLow             = 50     # score Endpoint Analytics global en-dessous duquel on alerte
+    BootSlowSeconds      = 90     # démarrage (core boot) au-delà duquel on alerte
+    BatteryPoor          = 50     # score batterie en-dessous duquel on alerte
+    BsodCritical         = 3      # écrans bleus (fenêtre 14 j) à partir desquels c'est critique
+    RestartsHigh         = 15     # redémarrages (fenêtre 14 j) jugés anormalement fréquents
+    SignatureStaleDays   = 7      # ancienneté des signatures antivirus (Defender) tolérée
+    UptimeWarningDays    = 14     # jours depuis le dernier démarrage connu -> à surveiller (estimation)
+    AppCrashWarning      = 5      # plantages d'une même application (fenêtre ~14 j) jugés anormaux
+    BatteryCapacityPoor  = 70     # capacité max restante (%) sous laquelle la batterie est à remplacer
+    BatteryCapacityCrit  = 50     # capacité max restante (%) sous laquelle le remplacement est urgent
+    BatteryRuntimeLowMin = 120    # autonomie estimée (minutes) sous laquelle le poste devient sédentaire
+    ConfigErrorsCritical = 3      # profils de configuration en échec rendant l'alerte critique
+}
 
 # ===== COORDONNÉES ENTREPRISE PAR DÉFAUT =====
 $DefaultCompanyName   = "ECONOCOM"
@@ -116,6 +183,7 @@ $Colors = @{
     UpdateRings     = "#0e7490"   # Pétrole
     Hardware        = "#92400e"   # Ambre brûlé
     DetailTables    = "#334155"   # Ardoise - tables de détail
+    Health          = "#0f766e"   # [v4.0] Sarcelle profonde - page Santé & proactivité
     # Couleurs d'identification des plateformes (cartes Overview)
     PlatformWindows = "#2563eb"
     PlatformIOS     = "#0e7490"
@@ -223,6 +291,54 @@ function Show-InfoMessage([string]$message) {
 function Set-UiStatus([string]$Text) {
     if ($lblStatus) { $lblStatus.Text = $Text }
     if ($form)      { $form.Refresh() }
+}
+
+# [FUSION v4 - Proactivité] Journal horodaté : console + $LogFile (rotation à 5 Mo).
+# Niveaux : INFO, WARN, ERROR, OK. Un échec d'écriture n'interrompt jamais le script.
+function Write-Log {
+    param(
+        [Parameter(Mandatory = $true)][string]$Message,
+        [ValidateSet("INFO", "WARN", "ERROR", "OK")][string]$Level = "INFO"
+    )
+    $line  = "[{0}] [{1}] {2}" -f (Get-Date).ToString("yyyy-MM-dd HH:mm:ss"), $Level, $Message
+    $color = switch ($Level) { "WARN" { "Yellow" } "ERROR" { "Red" } "OK" { "Green" } default { "Gray" } }
+    Write-Host $line -ForegroundColor $color
+    if (-not $LogFile) { return }
+    try {
+        $folder = Split-Path -Path $LogFile -Parent
+        if ($folder -and -not (Test-Path $folder)) { New-Item -ItemType Directory -Path $folder -Force -ErrorAction Stop | Out-Null }
+        if ((Test-Path $LogFile) -and ((Get-Item $LogFile).Length -gt 5MB)) {
+            $archive = Join-Path $folder ("dashboard-log_" + (Get-Date).ToString("yyyyMMdd_HHmmss") + ".txt")
+            Move-Item -Path $LogFile -Destination $archive -Force -ErrorAction SilentlyContinue
+        }
+        Add-Content -Path $LogFile -Value $line -Encoding UTF8 -ErrorAction Stop
+    } catch { }
+}
+
+# [v4.0] Étape de génération : ligne d'état de la fenêtre + journal
+function Write-Step([string]$Text) {
+    Set-UiStatus $Text
+    Write-Log $Text
+}
+
+# [FUSION v4 - Proactivité] Attente SANS geler la fenêtre WinForms : un simple
+# Start-Sleep bloque le thread d'interface, Windows affiche "Ne répond pas" pendant
+# un backoff de plusieurs dizaines de secondes. Ici les messages Windows sont pompés
+# toutes les 200 ms et un compte à rebours s'affiche. Hors interface (runspace de
+# collecte parallèle), c'est une attente ordinaire.
+function Start-ResponsiveSleep {
+    param([Parameter(Mandatory = $true)][int]$Seconds, [string]$Message = "Patientez")
+    if ($Seconds -le 0) { return }
+    if (-not $form) { Start-Sleep -Seconds $Seconds; return }
+    $endTime = (Get-Date).AddSeconds($Seconds)
+    while ((Get-Date) -lt $endTime) {
+        $remaining = [Math]::Max(0, [int][Math]::Ceiling(($endTime - (Get-Date)).TotalSeconds))
+        try {
+            if ($lblStatus) { $lblStatus.Text = "$Message ($remaining s restantes)..." }
+            [System.Windows.Forms.Application]::DoEvents()
+        } catch { }
+        Start-Sleep -Milliseconds 200
+    }
 }
 
 # ========================================
@@ -972,12 +1088,40 @@ function Get-IxSpaScript {
 '@
 }
 
+# [FUSION v4 - Proactivité] Pseudonymes STABLES le temps d'une génération : un même
+# poste / utilisateur porte le même alias dans toutes les pages et tous les CSV
+# (la v3 tirait un alias aléatoire par ligne : "Inactifs 30 j" et "Inactifs 60 j"
+# montraient deux alias différents pour un même poste). Remis à zéro à chaque génération.
+function Reset-AnonymizationMaps {
+    $script:AnonNameMap = @{}   # nom de poste réel (minuscules) -> pseudonyme
+    $script:AnonUpnMap  = @{}   # UPN réel (minuscules)          -> pseudonyme
+}
+
+function Get-AnonymizedIdentity {
+    param([string]$RealName, [string]$RealUpn)
+    if ($null -eq $script:AnonNameMap -or $null -eq $script:AnonUpnMap) { Reset-AnonymizationMaps }
+    $alias = ""
+    if (-not [string]::IsNullOrWhiteSpace($RealName)) {
+        $k = $RealName.Trim().ToLowerInvariant()
+        if (-not $script:AnonNameMap.ContainsKey($k)) { $script:AnonNameMap[$k] = "Poste-" + ([guid]::NewGuid().ToString().Substring(0, 8)) }
+        $alias = $script:AnonNameMap[$k]
+    }
+    $upnAlias = ""
+    if (-not [string]::IsNullOrWhiteSpace($RealUpn)) {
+        $k = $RealUpn.Trim().ToLowerInvariant()
+        if (-not $script:AnonUpnMap.ContainsKey($k)) { $script:AnonUpnMap[$k] = "User-" + ([guid]::NewGuid().ToString().Substring(0, 8)) }
+        $upnAlias = $script:AnonUpnMap[$k]
+    }
+    return [PSCustomObject]@{ Name = $alias; Upn = $upnAlias }
+}
+
 function Anonymize-DeviceData {
-    param([Parameter(Mandatory=$true)]$DeviceList)
+    param([Parameter(Mandatory=$true)][AllowEmptyCollection()]$DeviceList)
     return $DeviceList | ForEach-Object {
+        $anon = Get-AnonymizedIdentity -RealName $_.DeviceName -RealUpn $_.UserPrincipalName   # [v4.0] alias stables
         [PSCustomObject]@{
-            DeviceName              = "Poste-" + ([guid]::NewGuid().ToString().Substring(0, 8))
-            UserPrincipalName       = "User-"  + ([guid]::NewGuid().ToString().Substring(0, 8))
+            DeviceName              = $anon.Name
+            UserPrincipalName       = $anon.Upn
             OperatingSystem         = $_.OperatingSystem
             Manufacturer            = $_.Manufacturer
             Model                   = $_.Model
@@ -987,6 +1131,7 @@ function Anonymize-DeviceData {
             LastSyncDateTime        = $_.LastSyncDateTime
             EnrolledDateTime        = $_.EnrolledDateTime
             FreeStorageSpaceInBytes = $_.FreeStorageSpaceInBytes
+            TotalStorageSpaceInBytes = $_.TotalStorageSpaceInBytes
             # [MODIF v3] Conservation des champs d'analyse "Non Encrypted".
             # Ils valent $null pour les listes qui ne les possèdent pas :
             # sans impact sur les autres tables (colonnes non sélectionnées).
@@ -999,18 +1144,55 @@ function Anonymize-DeviceData {
 # ========================================
 # [v3.3] APPELS À L'API GRAPH : GESTION DES ERREURS
 # ========================================
-# Tous les appels REST des sections "Sécurité & conformité" (et les appels paginés
-# des Update Rings) passent par Invoke-GraphApiRequest :
+# [v4.0] TOUS les appels Graph du script passent par Invoke-GraphApiRequest (le
+# module Microsoft.Graph n'est plus utilisé) :
 #  - 429 (throttling), 500/502/503/504 et erreurs réseau : nouvelles tentatives
-#    bornées ($GraphMaxRetries), délai Retry-After sinon backoff exponentiel
+#    bornées ($GraphMaxRetries). Retry-After est un MINIMUM imposé par le service :
+#    il n'est jamais raccourci (le script Proactivité repartait en moyenne au bout
+#    de 23 s pour un Retry-After de 30 s). Sans Retry-After : backoff exponentiel
+#    bruité, pour que des flux limités au même instant ne repartent pas ensemble
+#  - 429 : pause COMMUNE à tous les flux parallèles (GraphContext.PauseUntilUtc)
 #  - 401 : jeton renouvelé une fois puis requête rejouée
 #  - autres erreurs (400, 403, 404...) : exception au message explicite (code
 #    HTTP, code Graph, request-id, piste de résolution). Le code HTTP est exposé
 #    dans Exception.Data['StatusCode'] pour les appelants.
+#  - attentes via Start-ResponsiveSleep : la fenêtre ne passe plus en "Ne répond pas"
 # Compatible Windows PowerShell 5.1 et PowerShell 7.
 
-# Contexte d'authentification de la génération en cours (renseigné dans Generate-Dashboard)
-$script:GraphAuth = $null
+# [v4.0] Contexte partagé de la génération en cours (créé par New-GraphContext dans
+# Generate-Dashboard). Table SYNCHRONISÉE, transmise telle quelle aux runspaces de
+# la collecte parallèle : jeton (un renouvellement profite à tous les flux) et pause
+# de throttling (un 429 reçu par un flux met tous les flux en pause).
+$script:GraphContext = $null
+
+# Fonctions exécutées dans les runspaces de la collecte parallèle (injectées via
+# InitialSessionState : une seule implémentation des reprises pour tout le script)
+$GraphWorkerFunctions = @(
+    'Invoke-GraphApiRequest', 'Get-GraphErrorInfo', 'Format-GraphErrorMessage', 'Get-GraphAccessToken',
+    'Wait-GraphThrottleGate', 'Get-GraphPagedResults', 'Start-ResponsiveSleep', 'Set-UiStatus', 'Write-Log'
+)
+
+function New-GraphContext {
+    param([string]$TenantId, [string]$ClientId, [string]$ClientSecret)
+    return [hashtable]::Synchronized(@{
+        TenantId      = $TenantId
+        ClientId      = $ClientId
+        ClientSecret  = $ClientSecret
+        AccessToken   = $null
+        ExpiresAtUtc  = [datetime]::MinValue
+        PauseUntilUtc = [datetime]::MinValue
+    })
+}
+
+# [v4.0] Attend la fin d'une pause de throttling posée par n'importe quel flux
+function Wait-GraphThrottleGate {
+    $ctx = $script:GraphContext
+    if (-not $ctx) { return }
+    $now = [datetime]::UtcNow
+    if ($ctx.PauseUntilUtc -le $now) { return }
+    $wait = [int][math]::Ceiling(($ctx.PauseUntilUtc - $now).TotalSeconds)
+    Start-ResponsiveSleep -Seconds $wait -Message "Limitation Microsoft Graph : pause commune à tous les flux"
+}
 
 # Extrait d'une erreur Invoke-RestMethod / Invoke-WebRequest : code HTTP,
 # délai Retry-After, code et message Graph (ou OAuth), request-id, erreur réseau.
@@ -1108,9 +1290,11 @@ function Format-GraphErrorMessage {
 # Jeton applicatif (client credentials) de la génération en cours : obtenu au
 # premier appel, renouvelé 5 minutes avant expiration ou sur demande (-ForceRefresh).
 # Retourne $null hors génération (les appelants utilisent alors leur -AccessToken).
+# Deux flux parallèles peuvent renouveler en même temps : sans conséquence, les deux
+# jetons obtenus sont valides (pas de verrou, donc aucun risque d'interblocage).
 function Get-GraphAccessToken {
     param([switch]$ForceRefresh)
-    $auth = $script:GraphAuth
+    $auth = $script:GraphContext
     if (-not $auth) { return $null }
 
     if ($ForceRefresh -or -not $auth.AccessToken -or (Get-Date).ToUniversalTime().AddMinutes(5) -ge $auth.ExpiresAtUtc) {
@@ -1127,7 +1311,8 @@ function Get-GraphAccessToken {
 }
 
 # Appel REST unique avec reprises sur erreur transitoire (voir en-tête de section).
-# -RawText : renvoie le corps décodé en UTF-8 (rapports Intune servis en flux binaire).
+# -RawText  : renvoie le corps décodé en UTF-8 (rapports Intune servis en flux binaire).
+# -RawBytes : [v4.0] renvoie le corps brut (archive ZIP d'un export de rapport).
 function Invoke-GraphApiRequest {
     param(
         [Parameter(Mandatory)][string]$Uri,
@@ -1137,6 +1322,7 @@ function Invoke-GraphApiRequest {
         [string]$AccessToken = "",
         [switch]$NoAuth,
         [switch]$RawText,
+        [switch]$RawBytes,
         [int]$MaxRetries = $GraphMaxRetries
     )
     $attempt      = 0
@@ -1145,6 +1331,7 @@ function Invoke-GraphApiRequest {
         $attempt++
         $params = @{ Method = $Method; Uri = $Uri; TimeoutSec = $GraphRequestTimeoutSec; ErrorAction = 'Stop' }
         if (-not $NoAuth) {
+            Wait-GraphThrottleGate
             $token = Get-GraphAccessToken
             if (-not $token) { $token = $AccessToken }
             $params.Headers = @{ Authorization = "Bearer $token" }
@@ -1152,16 +1339,18 @@ function Invoke-GraphApiRequest {
         if ($null -ne $Body) { $params.Body = $Body; $params.ContentType = $ContentType }
 
         try {
-            if ($RawText) {
-                $web = Invoke-WebRequest @params -UseBasicParsing
-                return [System.Text.Encoding]::UTF8.GetString($web.RawContentStream.ToArray())
+            if ($RawText -or $RawBytes) {
+                $web   = Invoke-WebRequest @params -UseBasicParsing
+                $bytes = $web.RawContentStream.ToArray()
+                if ($RawBytes) { return , $bytes }
+                return [System.Text.Encoding]::UTF8.GetString($bytes)
             }
             return (Invoke-RestMethod @params)
         } catch {
             $info = Get-GraphErrorInfo -ErrorRecord $_
 
             # 401 : jeton expiré ou révoqué -> un seul renouvellement, puis nouvelle tentative
-            if ($info.StatusCode -eq 401 -and -not $NoAuth -and -not $tokenRenewed -and $script:GraphAuth) {
+            if ($info.StatusCode -eq 401 -and -not $NoAuth -and -not $tokenRenewed -and $script:GraphContext) {
                 $tokenRenewed = $true
                 $renewed = $false
                 try { [void](Get-GraphAccessToken -ForceRefresh); $renewed = $true } catch { }
@@ -1170,14 +1359,24 @@ function Invoke-GraphApiRequest {
 
             $retryable = ($info.StatusCode -in @(429, 500, 502, 503, 504)) -or $info.IsNetworkError
             if ($retryable -and $attempt -le $MaxRetries) {
-                $delay = if ($info.RetryAfter -gt 0) { [math]::Min($info.RetryAfter, 120) } else { [math]::Min(60, [math]::Pow(2, $attempt)) }
-                $delay = [int][math]::Ceiling($delay)
-                $why   = if ($info.StatusCode -gt 0) { "HTTP $($info.StatusCode)" } else { "erreur réseau" }
-                $path  = $Uri
+                if ($info.RetryAfter -gt 0) {
+                    # Minimum imposé par Graph : jamais raccourci, seulement décalé de 0 à 2 s
+                    $delay = [int][math]::Min($info.RetryAfter, 120) + (Get-Random -Minimum 0 -Maximum 3)
+                } else {
+                    # Backoff exponentiel plafonné, tiré dans [fenêtre/2 ; fenêtre]
+                    $window = [math]::Min(60, [math]::Pow(2, $attempt))
+                    $delay  = [int][math]::Max(1, [math]::Round(($window / 2) + (Get-Random -Minimum 0.0 -Maximum 1.0) * ($window / 2)))
+                }
+                # [v4.0] Un 429 signale une limite du tenant : tous les flux patientent
+                if ($info.StatusCode -eq 429 -and $script:GraphContext) {
+                    $until = [datetime]::UtcNow.AddSeconds($delay)
+                    if ($until -gt $script:GraphContext.PauseUntilUtc) { $script:GraphContext.PauseUntilUtc = $until }
+                }
+                $why  = if ($info.StatusCode -gt 0) { "HTTP $($info.StatusCode)" } else { "erreur réseau" }
+                $path = $Uri
                 try { $path = ([uri]$Uri).AbsolutePath } catch { }
-                Write-Host "[Graph] $why sur $Method $path - nouvelle tentative $attempt/$MaxRetries dans $delay s" -ForegroundColor DarkYellow
-                Set-UiStatus "⏳ API Graph : $why, nouvelle tentative dans $delay s ($attempt/$MaxRetries)..."
-                Start-Sleep -Seconds $delay
+                Write-Log "[Graph] $why sur $Method $path - nouvelle tentative $attempt/$MaxRetries dans $delay s" -Level WARN
+                Start-ResponsiveSleep -Seconds $delay -Message "API Graph : $why, nouvelle tentative $attempt/$MaxRetries"
                 continue
             }
 
@@ -1245,7 +1444,10 @@ function Invoke-GraphReportQuery {
         if ($null -eq $columns) { $columns = @($resp.Schema | ForEach-Object { [string]$_.Column }) }
         if ($null -ne $resp.TotalRowCount) { $total = [int]$resp.TotalRowCount }
 
-        $values = if ($null -eq $resp.Values) { @() } else { @($resp.Values) }
+        # Affectation directe : "$values = if (...) { @($resp.Values) }" ferait passer le
+        # tableau par le pipeline, qui déplie une page d'UNE seule ligne en ses cellules
+        $values = @()
+        if ($null -ne $resp.Values) { $values = @($resp.Values) }
         foreach ($v in $values) {
             $o = [ordered]@{}
             for ($i = 0; $i -lt $columns.Count; $i++) { $o[$columns[$i]] = $v[$i] }
@@ -1257,6 +1459,187 @@ function Invoke-GraphReportQuery {
         if ($values.Count -eq 0 -or ($total -ge 0 -and $skip -ge $total) -or ($total -lt 0 -and $values.Count -lt $PageSize)) { break }
     }
     return [pscustomobject]@{ Columns = [string[]]$columns; Rows = $rows }
+}
+
+# [FUSION v4 - Proactivité] Requêtes Graph regroupées par lots de 20 via $batch
+# (limite du service), avec reprises à deux niveaux :
+#  - l'appel $batch lui-même passe par Invoke-GraphApiRequest (429/5xx/réseau/jeton) ;
+#  - les sous-requêtes limitées (429/503/504 dans un lot revenu en 200) sont
+#    rejouées jusqu'à $SubRequestRetries fois, en respectant leur Retry-After.
+# Les sous-requêtes comptent chacune dans le quota Graph : le gain porte sur la
+# latence (20 fois moins d'allers-retours), pas sur le throttling.
+# $Requests : @{ id = "..."; method = "GET"; url = "/deviceManagement/..." }
+# Retour    : sous-réponses { id; status; headers; body } (une sous-requête en erreur
+#             définitive est rendue avec son statut : à l'appelant de décider).
+function Invoke-GraphBatch {
+    param(
+        # AllowEmptyCollection : un lot vide est un cas normal (aucun poste à interroger)
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][array]$Requests,
+        [string]$AccessToken = "",
+        [ValidateSet('beta', 'v1.0')][string]$GraphVersion = "beta",
+        [int]$BatchSize = 20,
+        [int]$SubRequestRetries = 3,
+        [string]$Label = "Requêtes groupées"
+    )
+    $all = [System.Collections.Generic.List[object]]::new()
+    if (-not $Requests -or $Requests.Count -eq 0) { return $all.ToArray() }
+
+    # L'endpoint $batch exige un id unique par lot (400 sinon) : premières occurrences seulement
+    $seen = [System.Collections.Generic.HashSet[string]]::new()
+    $list = [System.Collections.Generic.List[object]]::new()
+    foreach ($r in $Requests) { if ($seen.Add([string]$r.id)) { $list.Add($r) } }
+
+    $endpoint = "https://graph.microsoft.com/$GraphVersion/`$batch"
+    $total    = $list.Count
+    for ($i = 0; $i -lt $total; $i += $BatchSize) {
+        $chunk = $list.GetRange($i, [math]::Min($BatchSize, $total - $i))
+        $byId  = @{}
+        foreach ($c in $chunk) { $byId[[string]$c.id] = $c }
+
+        $pending = @($chunk)
+        for ($round = 0; $pending.Count -gt 0; $round++) {
+            $body  = @{ requests = $pending } | ConvertTo-Json -Depth 6 -Compress
+            $resp  = Invoke-GraphApiRequest -Method POST -Uri $endpoint -Body $body -AccessToken $AccessToken
+            $retry = [System.Collections.Generic.List[object]]::new()
+            $hint  = 0
+            foreach ($sub in @($resp.responses)) {
+                if ($null -eq $sub) { continue }
+                $status = 0
+                try { $status = [int]$sub.status } catch { }
+                if ($status -in @(429, 503, 504) -and $round -lt $SubRequestRetries -and $byId.ContainsKey([string]$sub.id)) {
+                    $ra = 0
+                    try { [void][int]::TryParse([string]$sub.headers.'Retry-After', [ref]$ra) } catch { }
+                    if ($ra -gt $hint) { $hint = $ra }
+                    $retry.Add($byId[[string]$sub.id])
+                } else {
+                    $all.Add($sub)
+                }
+            }
+            $pending = @($retry)
+            if ($pending.Count -gt 0) {
+                $delay = if ($hint -gt 0) { [int][math]::Min(60, $hint) } else { [int][math]::Min(30, 3 * [math]::Pow(2, $round)) }
+                if ($script:GraphContext) {
+                    $until = [datetime]::UtcNow.AddSeconds($delay)
+                    if ($until -gt $script:GraphContext.PauseUntilUtc) { $script:GraphContext.PauseUntilUtc = $until }
+                }
+                Write-Log "$Label : $($pending.Count) sous-requête(s) limitée(s), nouvelle tentative dans $delay s." -Level WARN
+                Start-ResponsiveSleep -Seconds $delay -Message "$Label : $($pending.Count) requête(s) limitée(s)"
+            }
+        }
+        Set-UiStatus "$Label : $([math]::Min($i + $BatchSize, $total)) / $total..."
+    }
+    return $all.ToArray()
+}
+
+# [v4.0] Collecte séquentielle de listes Graph (repli de la collecte parallèle).
+# Corrige le script Proactivité, dont le repli appelait ".ToArray()" sur un tableau
+# PowerShell : l'erreur était attrapée et TOUTES les données de santé perdues.
+function Invoke-SequentialGraphCollections {
+    param([Parameter(Mandatory = $true)][hashtable]$Jobs, [string]$AccessToken = "")
+    $result = @{}
+    foreach ($name in @($Jobs.Keys)) {
+        Write-Step "Collecte : $name..."
+        try {
+            $result[$name] = [pscustomobject]@{ Items = @(Get-GraphPagedResults -Url $Jobs[$name] -AccessToken $AccessToken); Error = $null }
+        } catch {
+            $result[$name] = [pscustomobject]@{ Items = @(); Error = $_.Exception.Message }
+        }
+    }
+    return $result
+}
+
+# [FUSION v4 - Proactivité] Collecte PARALLÈLE de listes Graph indépendantes, dans un
+# pool de runspaces (ForEach-Object -Parallel n'existe qu'en PowerShell 7).
+# [v4.0] Différences avec le script Proactivité :
+#  - les runspaces exécutent les VRAIES fonctions du script ($GraphWorkerFunctions,
+#    injectées via InitialSessionState) au lieu d'une copie texte de la logique de
+#    reprise : Retry-After lu sous 5.1 et 7, jeton renouvelé, messages explicites ;
+#  - $script:GraphContext (table synchronisée) est partagé : un 429 met tous les
+#    flux en pause, un jeton renouvelé sert à tous ;
+#  - toute défaillance du pool bascule sur Invoke-SequentialGraphCollections.
+# $Jobs : Nom -> URL de première page (pagination faite dans le runspace).
+# Retour : Nom -> [pscustomobject]@{ Items = @(...); Error = <message> | $null }
+function Invoke-ParallelGraphCollections {
+    param([Parameter(Mandatory = $true)][hashtable]$Jobs, [string]$AccessToken = "", [int]$MaxConcurrency = 4)
+
+    if ($Jobs.Count -eq 0) { return @{} }
+    if ($Jobs.Count -eq 1 -or $MaxConcurrency -le 1) { return (Invoke-SequentialGraphCollections -Jobs $Jobs -AccessToken $AccessToken) }
+
+    $pool    = $null
+    $running = [System.Collections.Generic.List[object]]::new()
+    try {
+        $iss = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
+        foreach ($fn in $GraphWorkerFunctions) {
+            $cmd = Get-Command -Name $fn -CommandType Function -ErrorAction Stop
+            $iss.Commands.Add([System.Management.Automation.Runspaces.SessionStateFunctionEntry]::new($fn, $cmd.Definition))
+        }
+        $shared = @{
+            GraphContext           = $script:GraphContext
+            GraphMaxRetries        = $GraphMaxRetries
+            GraphRequestTimeoutSec = $GraphRequestTimeoutSec
+            LogFile                = $LogFile
+        }
+        foreach ($k in $shared.Keys) {
+            $iss.Variables.Add([System.Management.Automation.Runspaces.SessionStateVariableEntry]::new($k, $shared[$k], ""))
+        }
+        $pool = [runspacefactory]::CreateRunspacePool(1, $MaxConcurrency, $iss, $Host)
+        $pool.Open()
+
+        $worker = {
+            param($JobName, $JobUrl, $Token)
+            $ProgressPreference = "SilentlyContinue"
+            try {
+                [pscustomobject]@{ Name = $JobName; Items = @(Get-GraphPagedResults -Url $JobUrl -AccessToken $Token); Error = $null }
+            } catch {
+                [pscustomobject]@{ Name = $JobName; Items = @(); Error = $_.Exception.Message }
+            }
+        }
+        foreach ($name in @($Jobs.Keys)) {
+            $shell = [powershell]::Create()
+            $shell.RunspacePool = $pool
+            [void]$shell.AddScript($worker.ToString()).AddArgument($name).AddArgument($Jobs[$name]).AddArgument($AccessToken)
+            $running.Add([pscustomobject]@{ Name = $name; Shell = $shell; Handle = $shell.BeginInvoke() })
+        }
+    } catch {
+        Write-Log "Collecte parallèle indisponible ($($_.Exception.Message)) : bascule en collecte séquentielle." -Level WARN
+        foreach ($r in $running) { try { $r.Shell.Stop(); $r.Shell.Dispose() } catch { } }
+        if ($pool) { try { $pool.Dispose() } catch { } }
+        return (Invoke-SequentialGraphCollections -Jobs $Jobs -AccessToken $AccessToken)
+    }
+
+    Write-Log "Collecte parallèle : $($running.Count) jeu(x) de données, $MaxConcurrency flux simultanés." -Level INFO
+    $total = $running.Count
+    while ($true) {
+        $done = @($running | Where-Object { $_.Handle.IsCompleted }).Count
+        if ($done -ge $total) { break }
+        Set-UiStatus "Collecte parallèle : $done / $total jeu(x) de données terminé(s)..."
+        # Fenêtre réactive pendant l'attente (sans effet hors interface)
+        try { if ($form) { [System.Windows.Forms.Application]::DoEvents() } } catch { }
+        Start-Sleep -Milliseconds 200
+    }
+
+    $result = @{}
+    foreach ($r in $running) {
+        try {
+            $payload = @($r.Shell.EndInvoke($r.Handle)) | Where-Object { $_ -and $_.PSObject.Properties['Items'] } | Select-Object -First 1
+            if ($payload) { $result[$r.Name] = [pscustomobject]@{ Items = @($payload.Items); Error = $payload.Error } }
+            else          { $result[$r.Name] = [pscustomobject]@{ Items = @(); Error = "Aucune donnée renvoyée par le flux de collecte." } }
+        } catch {
+            $result[$r.Name] = [pscustomobject]@{ Items = @(); Error = $_.Exception.Message }
+        } finally {
+            try { $r.Shell.Dispose() } catch { }
+        }
+    }
+    try { $pool.Close(); $pool.Dispose() } catch { }
+    return $result
+}
+
+# [FUSION v4 - Proactivité] Lecture défensive d'un résultat de collecte : une source
+# absente, vide ou en erreur rend un tableau vide, jamais $null.
+function Get-CollectedItems {
+    param([hashtable]$Bag, [string]$Name)
+    if ($Bag -and $Bag.ContainsKey($Name) -and $Bag[$Name]) { return @($Bag[$Name].Items) }
+    return @()
 }
 
 # ========================================
@@ -1333,18 +1716,50 @@ $NcBadStates = @('nonCompliant', 'error', 'conflict')
 function Get-DeviceNonComplianceSettings {
     param(
         [Parameter(Mandatory)][string]$DeviceId,
-        [Parameter(Mandatory)][string]$AccessToken
+        [string]$AccessToken = ""
     )
     if ($null -ne $script:NcSettingsCache -and $script:NcSettingsCache.ContainsKey($DeviceId)) {
         return $script:NcSettingsCache[$DeviceId]
     }
-    $rows = [System.Collections.Generic.List[object]]::new()
 
     # 1) États des stratégies de conformité de l'appareil
     $polUri       = "https://graph.microsoft.com/beta/deviceManagement/managedDevices/$DeviceId/deviceCompliancePolicyStates"
     $policyStates = Get-GraphPagedResults -Url $polUri -AccessToken $AccessToken
 
-    foreach ($pol in @($policyStates)) {
+    $result = @(ConvertFrom-PolicyStates -DeviceId $DeviceId -PolicyStates $policyStates -AccessToken $AccessToken)
+    if ($null -ne $script:NcSettingsCache) { $script:NcSettingsCache[$DeviceId] = $result }
+    return $result
+}
+
+# [v4.0] Préchargement du cache par lots de 20 appareils ($batch) au lieu d'un appel
+# par appareil : utilisé avant l'analyse "Non Encrypted" et le repli par appareil de
+# l'analyse des non-conformités. Un appareil dont la sous-requête échoue (404, 403,
+# réponse paginée...) n'est pas mis en cache : il sera interrogé individuellement,
+# avec la gestion d'erreurs habituelle.
+function Initialize-NcSettingsCache {
+    param([string[]]$DeviceIds, [string]$AccessToken = "")
+    if ($null -eq $script:NcSettingsCache) { return }
+    $todo = @($DeviceIds | Where-Object { $_ -and -not $script:NcSettingsCache.ContainsKey($_) } | Select-Object -Unique)
+    if ($todo.Count -eq 0) { return }
+    $requests = foreach ($id in $todo) { @{ id = $id; method = "GET"; url = "/deviceManagement/managedDevices/$id/deviceCompliancePolicyStates" } }
+    try {
+        $responses = Invoke-GraphBatch -Requests @($requests) -AccessToken $AccessToken -Label "États de conformité par appareil"
+    } catch {
+        Write-Log "Préchargement groupé des états de conformité impossible ($($_.Exception.Message)) : interrogation appareil par appareil." -Level WARN
+        return
+    }
+    foreach ($r in $responses) {
+        if ([int]$r.status -ne 200 -or -not $r.body -or $r.body.'@odata.nextLink') { continue }
+        $script:NcSettingsCache[[string]$r.id] = @(ConvertFrom-PolicyStates -DeviceId ([string]$r.id) -PolicyStates @($r.body.value) -AccessToken $AccessToken)
+    }
+}
+
+# Lignes "paramètre en écart" à partir des états de stratégies d'un appareil
+function ConvertFrom-PolicyStates {
+    param([string]$DeviceId, [object[]]$PolicyStates, [string]$AccessToken = "")
+    $rows = [System.Collections.Generic.List[object]]::new()
+    foreach ($pol in @($PolicyStates)) {
+        if ($null -eq $pol) { continue }
         # On ne détaille que les stratégies en écart (nonCompliant / error / conflict)
         if ("$($pol.state)" -notin $NcBadStates) { continue }
 
@@ -1367,10 +1782,7 @@ function Get-DeviceNonComplianceSettings {
             $rows.Add([pscustomobject]@{ PolicyName = "$($pol.displayName)"; Setting = ""; SettingLabel = ""; State = "$($pol.state)" })
         }
     }
-
-    $result = $rows.ToArray()
-    if ($null -ne $script:NcSettingsCache) { $script:NcSettingsCache[$DeviceId] = $result }
-    return $result
+    return $rows.ToArray()
 }
 
 # [MODIF v3] Liste des raisons précises de non-conformité d'un appareil
@@ -1379,7 +1791,7 @@ function Get-DeviceNonComplianceSettings {
 function Get-DeviceNonComplianceReasons {
     param(
         [Parameter(Mandatory)][string]$DeviceId,
-        [Parameter(Mandatory)][string]$AccessToken
+        [string]$AccessToken = ""
     )
     $reasons = [System.Collections.Generic.List[string]]::new()
     try {
@@ -1509,7 +1921,7 @@ function Get-NcCell {
 
 # Date hétérogène (DateTime, DateTimeOffset, ISO 8601, JJ/MM/AAAA) -> DateTime UTC.
 # $null si vide ou antérieure à 2000 (Intune renvoie 0001-01-01 pour "jamais").
-function ConvertTo-NcUtcDate {
+function ConvertTo-UtcDate {
     param([object]$Value)
     if ($null -eq $Value) { return $null }
     $d = $null
@@ -1533,7 +1945,7 @@ function ConvertTo-NcUtcDate {
 }
 
 # DateTime UTC -> "JJ/MM/AAAA HH:MM" en heure locale (vide si $null)
-function Format-NcDate {
+function Format-LocalDate {
     param([object]$UtcDate)
     if ($null -eq $UtcDate) { return "" }
     return $UtcDate.ToLocalTime().ToString('dd/MM/yyyy HH:mm', [Globalization.CultureInfo]::InvariantCulture)
@@ -1577,8 +1989,8 @@ function New-NcRawRow {
         if (-not [string]::IsNullOrWhiteSpace("$Secondary")) { return "$Secondary".Trim() }
         return ""
     }
-    $lastSync = ConvertTo-NcUtcDate $Device.LastSyncDateTime
-    if ($null -eq $lastSync) { $lastSync = ConvertTo-NcUtcDate $Fallback.LastSync }
+    $lastSync = ConvertTo-UtcDate $Device.LastSyncDateTime
+    if ($null -eq $lastSync) { $lastSync = ConvertTo-UtcDate $Fallback.LastSync }
 
     return [pscustomobject]@{
         DeviceKey         = "$($Device.Id)"
@@ -1665,6 +2077,9 @@ function Get-NcRowsPerDevice {
     $failed    = 0
     $lastError = ""
     $idx       = 0
+    # [v4.0] Préchargement groupé ($batch, 20 appareils par appel) ; seuls les postes
+    # non résolus par lot sont ensuite interrogés un par un.
+    Initialize-NcSettingsCache -DeviceIds @($Devices | ForEach-Object { "$($_.Id)" }) -AccessToken $AccessToken
     foreach ($dev in $Devices) {
         $idx++
         if ($idx -eq 1 -or $idx % 5 -eq 0 -or $idx -eq $Devices.Count) {
@@ -1901,7 +2316,7 @@ function Get-NcDeviceSummary {
             'Poste'                = $best.DeviceName
             'Utilisateur (UPN)'    = $best.UserPrincipalName
             'OS'                   = $best.OperatingSystem
-            'Dernière synchro'     = Format-NcDate $best.LastSyncUtc
+            'Dernière synchro'     = Format-LocalDate $best.LastSyncUtc
             'Jours depuis synchro' = $best.DaysSinceSync
             'Statut synchro'       = $best.SyncStatus
             'Nb erreurs'           = $g.Count
@@ -1928,7 +2343,7 @@ function Select-NcDetailView {
             'Stratégie'            = $r.PolicyName
             'Statut paramètre'     = $r.SettingStatus
             'État conformité'      = $r.ComplianceState
-            'Dernière synchro'     = Format-NcDate $r.LastSyncUtc
+            'Dernière synchro'     = Format-LocalDate $r.LastSyncUtc
             'Jours depuis synchro' = $r.DaysSinceSync
             'Statut synchro'       = $r.SyncStatus
             'Action possible'      = $r.Action
@@ -1956,18 +2371,13 @@ function Get-NcKpiView {
 
 # Anonymisation cohérente : un même poste / utilisateur garde le même alias
 # sur toutes ses lignes (indispensable aux synthèses par poste)
+# [v4.0] Mêmes alias que toutes les autres pages (table Get-AnonymizedIdentity)
 function Protect-NcRows {
     param([object[]]$Rows)
-    $devices = @{}
-    $users   = @{}
     foreach ($r in $Rows) {
-        if (-not $devices.ContainsKey($r.DeviceKey)) { $devices[$r.DeviceKey] = "Poste-" + ([guid]::NewGuid().ToString().Substring(0, 8)) }
-        $r.DeviceName = $devices[$r.DeviceKey]
-        $u = "$($r.UserPrincipalName)".ToLowerInvariant()
-        if ($u) {
-            if (-not $users.ContainsKey($u)) { $users[$u] = "User-" + ([guid]::NewGuid().ToString().Substring(0, 8)) }
-            $r.UserPrincipalName = $users[$u]
-        }
+        $anon = Get-AnonymizedIdentity -RealName $r.DeviceName -RealUpn $r.UserPrincipalName
+        $r.DeviceName        = $anon.Name
+        $r.UserPrincipalName = $anon.Upn
     }
 }
 
@@ -2051,36 +2461,18 @@ function Invoke-NonComplianceAnalysis {
 # Export CSV des synthèses (séparateur $NcCsvDelimiter, UTF-8 avec BOM pour Excel).
 # Chaque fichier est écrit indépendamment : un échec (fichier ouvert dans Excel,
 # droits...) est ajouté aux avertissements sans bloquer les autres.
-function Export-NcCsvReports {
-    param([object]$Result, [string]$Folder, [string]$ClientName = "")
-
-    $written = [System.Collections.Generic.List[string]]::new()
-    try {
-        if (-not (Test-Path -LiteralPath $Folder)) { New-Item -ItemType Directory -Path $Folder -Force -ErrorAction Stop | Out-Null }
-    } catch {
-        $Result.Warnings.Add("Export CSV impossible : le dossier « $Folder » n'a pas pu être créé ($($_.Exception.Message)).")
-        return @()
+# [v4.0] Jeux de données CSV de l'analyse des non-conformités, écrits par
+# Export-AllDatasets avec toutes les autres sections (même dossier horodaté).
+# Les clés deviennent les noms de fichiers (préfixe = ordre dans le dossier).
+function Get-NcCsvDatasets {
+    param([object]$Result, [string]$ClientName = "", [string]$Prefix = "")
+    return [ordered]@{
+        "${Prefix}0_Indicateurs"            = @(Get-NcKpiView -Result $Result -ClientName $ClientName)
+        "${Prefix}1_Synthese_Categories"    = @($Result.CategorySummary)
+        "${Prefix}2_Synthese_Raisons"       = @($Result.ReasonSummary)
+        "${Prefix}3_Synthese_Postes"        = @($Result.DeviceSummary)
+        "${Prefix}4_Detail_Non_Conformites" = @(Select-NcDetailView -Rows $Result.Rows)
     }
-
-    $files = [ordered]@{
-        '0_Indicateurs.csv'            = @(Get-NcKpiView -Result $Result -ClientName $ClientName)
-        '1_Synthese_Categories.csv'    = @($Result.CategorySummary)
-        '2_Synthese_Raisons.csv'       = @($Result.ReasonSummary)
-        '3_Synthese_Postes.csv'        = @($Result.DeviceSummary)
-        '4_Detail_Non_Conformites.csv' = @(Select-NcDetailView -Rows $Result.Rows)
-    }
-    $utf8Bom = [System.Text.UTF8Encoding]::new($true)
-    foreach ($name in @($files.Keys)) {
-        $path = Join-Path $Folder $name
-        try {
-            $lines = [string[]]@($files[$name] | ConvertTo-Csv -NoTypeInformation -Delimiter $NcCsvDelimiter)
-            [System.IO.File]::WriteAllLines($path, $lines, $utf8Bom)
-            $written.Add($path)
-        } catch {
-            $Result.Warnings.Add("Export CSV « $name » en échec : $($_.Exception.Message)")
-        }
-    }
-    return $written.ToArray()
 }
 
 # Bloc d'en-tête de la section "Non-Compliance Analysis" : KPI, règle de lecture,
@@ -2136,19 +2528,1028 @@ function New-NcDashboardHeadHtml {
 }
 
 # ========================================
+# [v4.0] COLLECTES REST (REMPLACENT LE MODULE MICROSOFT.GRAPH)
+# ========================================
+# Les objets sont normalisés aux noms de propriétés du SDK utilisés en v3
+# (PascalCase) : tables, filtres et graphiques restent inchangés. Les dates sont des
+# DateTime UTC lues depuis la valeur brute, jamais via une conversion en texte (qui
+# dépend de la culture régionale du poste : piège décrit dans le script Proactivité).
+
+# Champs utiles des appareils : environ 13 au lieu des ~60 renvoyés sans $select
+$ManagedDeviceSelect = "id,deviceName,userPrincipalName,operatingSystem,osVersion,complianceState,lastSyncDateTime,enrolledDateTime,manufacturer,model,isEncrypted,freeStorageSpaceInBytes,totalStorageSpaceInBytes"
+
+# Entier long ou $null (champs de stockage absents sur certaines plateformes)
+function ConvertTo-NullableLong {
+    param($Value)
+    if ($null -eq $Value -or "$Value" -eq "") { return $null }
+    $n = [long]0
+    if ([long]::TryParse("$Value", [ref]$n)) { return $n }
+    return $null
+}
+
+# Décimal ou $null. -NonNegative : Endpoint Analytics code "non mesuré" par -1
+function ConvertTo-NullableDouble {
+    param($Value, [switch]$NonNegative)
+    if ($null -eq $Value -or "$Value" -eq "") { return $null }
+    $d = 0.0
+    if (-not [double]::TryParse(("$Value" -replace ',', '.'), [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$d)) { return $null }
+    if ($NonNegative -and $d -lt 0) { return $null }
+    return $d
+}
+
+function Get-ManagedDevicesRest {
+    param([string]$AccessToken = "")
+    $url  = "https://graph.microsoft.com/v1.0/deviceManagement/managedDevices?`$select=$ManagedDeviceSelect&`$top=999"
+    $seen = [System.Collections.Generic.HashSet[string]]::new()
+    $list = [System.Collections.Generic.List[object]]::new()
+    foreach ($d in @(Get-GraphPagedResults -Url $url -AccessToken $AccessToken)) {
+        # Dédoublonnage par id dès la source (co-gestion, pagination)
+        if ($null -eq $d -or -not $d.id -or -not $seen.Add([string]$d.id)) { continue }
+        $list.Add([pscustomobject]@{
+            Id                       = [string]$d.id
+            DeviceName               = [string]$d.deviceName
+            UserPrincipalName        = [string]$d.userPrincipalName
+            OperatingSystem          = [string]$d.operatingSystem
+            OSVersion                = [string]$d.osVersion
+            ComplianceState          = [string]$d.complianceState
+            LastSyncDateTime         = ConvertTo-UtcDate $d.lastSyncDateTime
+            EnrolledDateTime         = ConvertTo-UtcDate $d.enrolledDateTime
+            Manufacturer             = [string]$d.manufacturer
+            Model                    = [string]$d.model
+            IsEncrypted              = ($d.isEncrypted -eq $true)
+            FreeStorageSpaceInBytes  = ConvertTo-NullableLong $d.freeStorageSpaceInBytes
+            TotalStorageSpaceInBytes = ConvertTo-NullableLong $d.totalStorageSpaceInBytes
+        })
+    }
+    return $list.ToArray()
+}
+
+function Get-MobileAppsRest {
+    param([string]$AccessToken = "")
+    foreach ($a in @(Get-GraphPagedResults -Url "https://graph.microsoft.com/v1.0/deviceAppManagement/mobileApps" -AccessToken $AccessToken)) {
+        if ($null -eq $a) { continue }
+        [pscustomobject]@{
+            DisplayName     = [string]$a.displayName
+            Publisher       = [string]$a.publisher
+            Id              = [string]$a.id
+            CreatedDateTime = ConvertTo-UtcDate $a.createdDateTime
+        }
+    }
+}
+
+# Profils de configuration (modèles) : servent aux Update Rings ET à la vérification
+# "profils en erreur" de la page Santé ; lus une seule fois par génération.
+function Get-DeviceConfigurationsRest {
+    param([string]$AccessToken = "")
+    $base  = "https://graph.microsoft.com/beta/deviceManagement/deviceConfigurations"
+    $items = @(Get-GraphPagedResults -Url "${base}?`$select=id,displayName" -AccessToken $AccessToken)
+    # Le type (@odata.type) identifie les Update Rings : s'il manque avec $select, relecture complète
+    if ($items.Count -gt 0 -and @($items | Where-Object { $_.'@odata.type' }).Count -eq 0) {
+        $items = @(Get-GraphPagedResults -Url $base -AccessToken $AccessToken)
+    }
+    return $items
+}
+
+# [FUSION v4 - Proactivité] Rapports Intune : tableau d'objets, ou { Schema, Values }
+# à lignes positionnelles. Toujours restitués en objets à propriétés nommées.
+function ConvertFrom-IntuneReportPayload {
+    param($Payload)
+    if ($null -eq $Payload) { return @() }
+    if ($Payload.PSObject.Properties['Schema'] -and $Payload.PSObject.Properties['Values']) {
+        if ($null -eq $Payload.Values) { return @() }
+        $columns = @($Payload.Schema | ForEach-Object { [string]$_.Column })
+        $rows    = [System.Collections.Generic.List[object]]::new()
+        foreach ($line in @($Payload.Values)) {
+            $cells  = @($line)
+            $record = [ordered]@{}
+            for ($i = 0; $i -lt $columns.Count; $i++) {
+                $cell = $null
+                if ($i -lt $cells.Count) { $cell = $cells[$i] }
+                $record[$columns[$i]] = $cell
+            }
+            $rows.Add([pscustomobject]$record)
+        }
+        return $rows.ToArray()
+    }
+    return @($Payload)
+}
+
+# Rapport des échecs d'installation d'applications (v3, désormais via Invoke-GraphApiRequest)
+function Get-FailedAppsReportRest {
+    param([string]$AccessToken = "")
+    $body = @{ top = 5000; orderBy = @("FailedDeviceCount desc") } | ConvertTo-Json -Compress
+    $resp = Invoke-GraphApiRequest -Method POST -Uri "https://graph.microsoft.com/beta/deviceManagement/reports/getFailedMobileAppsReport" `
+                                   -Body $body -AccessToken $AccessToken -RawText
+    return @(ConvertFrom-IntuneReportPayload (ConvertFrom-GraphReportPayload $resp))
+}
+
+# Statuts des Windows Update Rings (logique v3 : comptes utilisateurs réels seulement).
+# [v4.0] Erreurs remontées en avertissements (la v3 les masquait par un "catch {}" vide).
+function Get-UpdateRingData {
+    param([object[]]$Configurations, [string]$AccessToken = "", [System.Collections.Generic.List[string]]$Warnings)
+    $summary = [System.Collections.Generic.List[object]]::new()
+    $devices = [System.Collections.Generic.List[object]]::new()
+    $rings   = @($Configurations | Where-Object { "$($_.'@odata.type')" -like "*windowsUpdateForBusinessConfiguration*" })
+    foreach ($pol in $rings) {
+        try {
+            $statuses = @(Get-GraphPagedResults -Url "https://graph.microsoft.com/beta/deviceManagement/deviceConfigurations/$($pol.id)/deviceStatuses?`$top=1000" -AccessToken $AccessToken)
+        } catch {
+            if ($Warnings) { $Warnings.Add("Update Ring « $($pol.displayName) » : $($_.Exception.Message)") }
+            continue
+        }
+        $userStatuses = @($statuses | Where-Object { $_ -and $_.userName -and "$($_.userName)".Trim() -ne "" -and $_.userName -ne "System account" -and $_.userName -match "@" })
+        if ($userStatuses.Count -eq 0) { continue }
+        $count = @{ compliant = 0; error = 0; conflict = 0; notApplicable = 0; inProgress = 0 }
+        foreach ($ds in $userStatuses) {
+            $st = "$($ds.status)"
+            if ($count.ContainsKey($st)) { $count[$st]++ }
+            $devices.Add([pscustomobject]@{
+                RingName     = [string]$pol.displayName
+                DeviceName   = [string]$ds.deviceDisplayName
+                UserName     = [string]$ds.userName
+                Status       = $st
+                LastReported = ConvertTo-UtcDate $ds.lastReportedDateTime
+            })
+        }
+        $summary.Add([pscustomobject]@{
+            RingName      = [string]$pol.displayName
+            DeviceCount   = $userStatuses.Count
+            Succeeded     = $count.compliant
+            Error         = $count.error
+            Conflict      = $count.conflict
+            NotApplicable = $count.notApplicable
+            InProgress    = $count.inProgress
+        })
+    }
+    return [pscustomobject]@{
+        Summary   = @($summary | Sort-Object RingName)
+        Devices   = @($devices | Sort-Object RingName, DeviceName)
+        RingCount = $rings.Count
+    }
+}
+
+# ========================================
+# [FUSION v4 - Proactivité] SANTÉ & PROACTIVITÉ DES POSTES
+# ========================================
+# OBJECTIF : donner de quoi AGIR AVANT l'incident. Reprise de l'onglet "Remédiation &
+# santé des postes" du script Proactivité (14 vérifications, seuils
+# $RemediationThresholds), affichée dans la page "Santé & proactivité" qui absorbe
+# l'ancienne page "Optimisation du parc".
+# SOURCES :
+#   * disque, inactivité, conformité : appareils déjà collectés (aucun appel en plus)
+#   * Endpoint Analytics (beta) : scores, performances de démarrage, batteries,
+#     fiabilité des applications, historique de démarrage ; + états BitLocker
+#     -> listes indépendantes, lues en parallèle (Invoke-ParallelGraphCollections)
+#   * Defender : windowsProtectionState, un appel par poste WINDOWS, regroupés en $batch
+#   * Mises à jour Windows : export du rapport Intune QualityUpdateDeviceStatusByPolicy
+#   * Profils de configuration : deviceStatuses de chaque profil, regroupés en $batch
+# PRÉREQUIS : l'Analyse des points de terminaison doit être ACTIVÉE dans Intune ; à
+# défaut, les vérifications concernées restent vides et un avertissement l'indique.
+# Permissions : DeviceManagementManagedDevices.Read.All et
+# DeviceManagementConfiguration.Read.All (déjà requises par le reste du script).
+# Chaque vérification est en "meilleur effort" : une source indisponible n'arrête
+# jamais la génération.
+# [v4.0] Écarts volontaires avec le script Proactivité :
+#   - accumulations en List : les "+=" coûtaient 8 s contre 0,2 s sur 20 000 postes ;
+#   - Defender limité aux postes Windows (iOS / Android renvoyaient tous une erreur) ;
+#   - historique de démarrage rapproché AUSSI par deviceId / startTime, les noms de
+#     champs du schéma Graph documenté (le script Proactivité ne cherchait que
+#     deviceName / startupDateTime) ;
+#   - fiabilité applicative : seule la vue par poste, réellement exploitée, est lue ;
+#   - conformité : motif exact repris de l'analyse des non-conformités (page Sécurité) ;
+#   - postes présents dans Endpoint Analytics mais hors du périmètre analysé (VM
+#     exclues, appareils supprimés) ignorés, pour des totaux cohérents entre pages ;
+#   - pas de boutons Sync / Reboot / Remédier : l'outil reste en lecture seule.
+
+# Vérifications activables une à une (onglet "Proactivité" de la fenêtre). Une
+# vérification décochée n'est ni collectée ni affichée : aucun appel superflu.
+$HealthCheckDefs = @(
+    @{ Key = "Disk";           Text = "Espace disque";               Col = 0; Row = 0
+       Hint = "Alerte sous $($RemediationThresholds.DiskFreePctWarning) % d'espace libre, critique sous $($RemediationThresholds.DiskFreePctCritical) % ou $($RemediationThresholds.DiskFreeGbCritical) Go." }
+    @{ Key = "Inactivity";     Text = "Inactivité (synchro)";        Col = 0; Row = 1
+       Hint = "Postes sans synchronisation depuis plus de $($RemediationThresholds.StaleDaysWarning) jours ; critique au-delà de $($RemediationThresholds.StaleDaysCritical) jours." }
+    @{ Key = "Boot";           Text = "Démarrage lent / HDD";        Col = 0; Row = 2
+       Hint = "Démarrage au-delà de $($RemediationThresholds.BootSlowSeconds) s, et postes encore équipés d'un disque mécanique (Endpoint Analytics)." }
+    @{ Key = "Bsod";           Text = "Écrans bleus / redémarrages"; Col = 0; Row = 3
+       Hint = "Écrans bleus sur 14 jours (critique à partir de $($RemediationThresholds.BsodCritical)) et redémarrages anormalement fréquents (Endpoint Analytics)." }
+    @{ Key = "Battery";        Text = "Batterie (score)";            Col = 1; Row = 0
+       Hint = "Score de santé composite Endpoint Analytics, alerte sous $($RemediationThresholds.BatteryPoor)." }
+    @{ Key = "BatteryDetail";  Text = "Batterie (capacité, âge)";    Col = 1; Row = 1
+       Hint = "Capacité maximale restante, âge et autonomie estimée. Alerte sous $($RemediationThresholds.BatteryCapacityPoor) % de capacité, critique sous $($RemediationThresholds.BatteryCapacityCrit) %." }
+    @{ Key = "EaScore";        Text = "Score Endpoint Analytics";    Col = 1; Row = 2
+       Hint = "Score global du poste, alerte sous $($RemediationThresholds.ScoreLow)." }
+    @{ Key = "Uptime";         Text = "Uptime (estimation)";         Col = 1; Row = 3
+       Hint = "Temps écoulé depuis le dernier démarrage connu, au-delà de $($RemediationThresholds.UptimeWarningDays) jours. Donnée agrégée quotidiennement par Microsoft : c'est une estimation." }
+    @{ Key = "BitLocker";      Text = "BitLocker (états avancés)";   Col = 2; Row = 0
+       Hint = "Chiffrement du volume système et véritables échecs de protection (managedDeviceEncryptionStates). La page Sécurité s'appuie, elle, sur l'indicateur isEncrypted de l'appareil." }
+    @{ Key = "Defender";       Text = "Antivirus (Defender)";        Col = 2; Row = 1
+       Hint = "Protection en temps réel désactivée et signatures en retard de plus de $($RemediationThresholds.SignatureStaleDays) jours. Un appel par poste Windows, regroupés par 20." }
+    @{ Key = "WindowsUpdate";  Text = "Mises à jour Windows";        Col = 2; Row = 2
+       Hint = "Échecs de mises à jour qualité (rapport Intune). Nécessite des postes rattachés à une stratégie de mises à jour Windows ; peut ajouter jusqu'à 90 s de génération du rapport." }
+    @{ Key = "AppReliability"; Text = "Fiabilité des applications";  Col = 2; Row = 3
+       Hint = "Application qui plante le plus souvent sur chaque poste, à partir de $($RemediationThresholds.AppCrashWarning) plantages (Endpoint Analytics)." }
+    @{ Key = "Compliance";     Text = "Conformité Intune";           Col = 3; Row = 0
+       Hint = "État de conformité du poste, avec le motif exact si l'analyse des non-conformités est active. Aucun appel réseau supplémentaire." }
+    @{ Key = "ConfigProfile";  Text = "Profils de configuration";    Col = 3; Row = 1
+       Hint = "Postes en erreur ou en conflit d'application d'un profil (modèles et catalogue de paramètres) : le poste reste conforme mais n'applique pas le paramétrage attendu." }
+)
+
+# Libellés de sévérité (préfixe numérique : le tri des tableaux suit l'urgence)
+$HealthSeverityLabels = @{ crit = "1 - Critique"; warn = "2 - À surveiller"; ok = "3 - OK" }
+$HealthSeverityRank   = @{ ok = 0; warn = 1; crit = 2 }
+
+# Clé de rapprochement par nom de poste : minuscules, sans accents ni ponctuation
+function Get-DeviceNameKey {
+    param([string]$Name)
+    return ((Get-NormalizedKey $Name) -replace ' ', '')
+}
+
+# [FUSION v4 - Proactivité] Valeur d'une propriété quelle que soit sa casse ou sa graphie
+# (DeviceName / deviceName / deviceDisplayName). [v4.0] Valeur BRUTE, pas convertie en
+# texte : une date convertie en texte dépendrait de la culture régionale du poste.
+function Get-PropValue {
+    param($Object, [string[]]$Names)
+    if ($null -eq $Object) { return $null }
+    foreach ($n in $Names) {
+        $p = $Object.PSObject.Properties[$n]
+        if ($p -and $null -ne $p.Value -and "$($p.Value)" -ne "") { return $p.Value }
+    }
+    return $null
+}
+
+# Index nom de poste normalisé -> premier élément rencontré
+function New-NameIndex {
+    param([object[]]$Items, [string[]]$NameProps)
+    $index = @{}
+    foreach ($it in @($Items)) {
+        if ($null -eq $it) { continue }
+        $k = Get-DeviceNameKey ([string](Get-PropValue $it $NameProps))
+        if ($k -and -not $index.ContainsKey($k)) { $index[$k] = $it }
+    }
+    return $index
+}
+
+# [FUSION v4 - Proactivité] Échecs de mises à jour qualité Windows, via l'export de
+# rapport Intune (job asynchrone : création, attente, téléchargement).
+# [v4.0] Archive ZIP lue en mémoire (plus de fichiers temporaires), attente réactive,
+# appels via Invoke-GraphApiRequest (reprises, jeton). Lève une exception si le
+# rapport n'aboutit pas : l'appelant la transforme en avertissement.
+function Get-WindowsUpdateFailures {
+    param([string]$AccessToken = "", [int]$MaxWaitSeconds = 90)
+    $jobsUri = "https://graph.microsoft.com/beta/deviceManagement/reports/exportJobs"
+    $body    = @{ reportName = "QualityUpdateDeviceStatusByPolicy"; format = "json" } | ConvertTo-Json -Compress
+    $job     = Invoke-GraphApiRequest -Method POST -Uri $jobsUri -Body $body -AccessToken $AccessToken
+    $status  = $job
+    $waited  = 0
+    while ("$($status.status)" -notin @('completed', 'failed') -and $waited -lt $MaxWaitSeconds) {
+        Start-ResponsiveSleep -Seconds 5 -Message "Rapport des mises à jour Windows en cours de génération"
+        $waited += 5
+        $status = Invoke-GraphApiRequest -Uri "https://graph.microsoft.com/beta/deviceManagement/reports/exportJobs('$($job.id)')" -AccessToken $AccessToken
+    }
+    if ("$($status.status)" -ne 'completed' -or -not $status.url) {
+        throw "rapport non abouti après $waited s (statut « $($status.status) »)"
+    }
+
+    # URL de téléchargement signée (SAS) : surtout pas d'en-tête d'autorisation
+    $bytes = Invoke-GraphApiRequest -NoAuth -Uri $status.url -RawBytes
+    Add-Type -AssemblyName System.IO.Compression
+    $zip = [System.IO.Compression.ZipArchive]::new([System.IO.MemoryStream]::new($bytes))
+    try {
+        $entry = @($zip.Entries | Where-Object { $_.Name -like '*.json' }) | Select-Object -First 1
+        if (-not $entry) { return @() }
+        $reader = [System.IO.StreamReader]::new($entry.Open(), [System.Text.Encoding]::UTF8)
+        try { $json = $reader.ReadToEnd() } finally { $reader.Dispose() }
+    } finally { $zip.Dispose() }
+    return @(ConvertFrom-IntuneReportPayload (ConvertFrom-GraphReportPayload $json))
+}
+
+# [FUSION v4 - Proactivité] Postes en ERREUR ou en CONFLIT d'application d'un profil de
+# configuration : modèles (deviceConfigurations, déjà lus pour les Update Rings) ET
+# catalogue de paramètres (configurationPolicies). Statuts interrogés PAR PROFIL (quelques
+# dizaines d'appels groupés en $batch) et non par appareil (des milliers d'appels).
+function Get-ConfigurationProfileErrors {
+    param(
+        [object[]]$DeviceConfigurations, [string]$AccessToken = "", [int]$MaxProfiles = 300,
+        [System.Collections.Generic.List[string]]$Warnings
+    )
+    $profiles = [System.Collections.Generic.List[object]]::new()
+    foreach ($p in @($DeviceConfigurations)) {
+        if ($p -and $p.id) { $profiles.Add([pscustomobject]@{ Id = [string]$p.id; Name = [string]$p.displayName; Segment = "deviceConfigurations" }) }
+    }
+    try {
+        foreach ($p in @(Get-GraphPagedResults -Url "https://graph.microsoft.com/beta/deviceManagement/configurationPolicies?`$select=id,name&`$top=200" -AccessToken $AccessToken)) {
+            if ($p -and $p.id) { $profiles.Add([pscustomobject]@{ Id = [string]$p.id; Name = [string]$p.name; Segment = "configurationPolicies" }) }
+        }
+    } catch {
+        if ($Warnings) { $Warnings.Add("Catalogue de paramètres indisponible : $($_.Exception.Message)") }
+    }
+
+    $list = @($profiles)
+    if ($list.Count -eq 0) { return @() }
+    if ($list.Count -gt $MaxProfiles) {
+        if ($Warnings) { $Warnings.Add("Profils de configuration : $($list.Count) profils, analyse limitée aux $MaxProfiles premiers (`$MaxConfigProfilesAnalyzed).") }
+        $list = $list[0..($MaxProfiles - 1)]
+    }
+
+    # Pas de $select / $filter sur deviceStatuses : leur prise en charge varie selon le
+    # type de profil, et un rejet en 400 ferait perdre tout le lot. Tri local.
+    $requests = [System.Collections.Generic.List[object]]::new()
+    $byId     = @{}
+    $n        = 0
+    foreach ($p in $list) {
+        $n++
+        $byId["cfg$n"] = $p
+        $requests.Add(@{ id = "cfg$n"; method = "GET"; url = "/deviceManagement/$($p.Segment)/$($p.Id)/deviceStatuses?`$top=999" })
+    }
+    Write-Step "🧩 Santé des postes : application de $($list.Count) profil(s) de configuration..."
+    $responses = Invoke-GraphBatch -Requests $requests.ToArray() -AccessToken $AccessToken -Label "Profils de configuration"
+
+    $failures  = [System.Collections.Generic.List[object]]::new()
+    $truncated = 0
+    foreach ($r in @($responses)) {
+        $status = 0
+        try { $status = [int]$r.status } catch { }
+        if ($status -ne 200 -or -not $r.body -or -not $byId.ContainsKey([string]$r.id)) { continue }
+        $p = $byId[[string]$r.id]
+        if ($r.body.'@odata.nextLink') { $truncated++ }
+        foreach ($st in @($r.body.value)) {
+            if ($null -eq $st) { continue }
+            $state = "$($st.status)".Trim().ToLowerInvariant()
+            if ($state -ne 'error' -and $state -ne 'conflict') { continue }
+            $failures.Add([pscustomobject]@{
+                DeviceName   = [string]$st.deviceDisplayName
+                UserName     = [string]$st.userName
+                ProfileName  = $p.Name
+                Status       = $state
+                LastReported = ConvertTo-UtcDate $st.lastReportedDateTime
+            })
+        }
+    }
+    if ($truncated -gt 0 -and $Warnings) { $Warnings.Add("Profils de configuration : $truncated profil(s) de plus de 999 postes, décompte partiel pour ceux-là.") }
+    Write-Log "Profils de configuration : $($failures.Count) application(s) en erreur ou en conflit sur $($list.Count) profil(s)."
+    return $failures.ToArray()
+}
+
+# [FUSION v4 - Proactivité] Collecte des données de santé selon les vérifications cochées
+# (une vérification décochée ne déclenche aucun appel). Ne lève pas d'exception : toute
+# source indisponible devient un avertissement affiché dans la page et le message final.
+function Invoke-HealthCollection {
+    param(
+        [object[]]$Devices, [hashtable]$Checks, [object[]]$DeviceConfigurations,
+        [string]$AccessToken = "", [bool]$Parallel = $true,
+        [System.Collections.Generic.List[string]]$Warnings
+    )
+    $base = "https://graph.microsoft.com/beta/deviceManagement"
+    $jobs = @{}
+    if ($Checks.EaScore -or $Checks.Battery) { $jobs["Scores Endpoint Analytics"]  = "$base/userExperienceAnalyticsDeviceScores?`$top=999" }
+    if ($Checks.Boot -or $Checks.Bsod)       { $jobs["Performances de démarrage"]  = "$base/userExperienceAnalyticsDevicePerformance?`$top=999" }
+    if ($Checks.BatteryDetail)               { $jobs["Santé des batteries"]        = "$base/userExperienceAnalyticsBatteryHealthDevicePerformance?`$top=999" }
+    if ($Checks.AppReliability)              { $jobs["Fiabilité des applications"] = "$base/userExperienceAnalyticsAppHealthDevicePerformanceDetails?`$top=999" }
+    if ($Checks.Uptime)                      { $jobs["Historique de démarrage"]    = "$base/userExperienceAnalyticsDeviceStartupHistory?`$top=999" }
+    if ($Checks.BitLocker)                   { $jobs["État BitLocker"]             = "$base/managedDeviceEncryptionStates?`$top=999" }
+
+    $collected = @{}
+    if ($jobs.Count -gt 0) {
+        if ($Parallel) {
+            Write-Step "🩺 Santé des postes : $($jobs.Count) jeu(x) de données lus en parallèle..."
+            $collected = Invoke-ParallelGraphCollections -Jobs $jobs -AccessToken $AccessToken -MaxConcurrency $MaxParallelCollections
+        } else {
+            $collected = Invoke-SequentialGraphCollections -Jobs $jobs -AccessToken $AccessToken
+        }
+        foreach ($name in @($collected.Keys)) {
+            if ($collected[$name].Error) {
+                $Warnings.Add("$name indisponible : $($collected[$name].Error)")
+                Write-Log "$name indisponible : $($collected[$name].Error)" -Level WARN
+            } else {
+                Write-Log "$name : $(@($collected[$name].Items).Count) élément(s)."
+            }
+        }
+    }
+
+    # ----- Defender : pas de liste globale côté Graph, un appel par poste Windows -----
+    $defender = @{}
+    if ($Checks.Defender) {
+        $windows = @($Devices | Where-Object { $_.Id -and "$($_.OperatingSystem)" -like "Windows*" })
+        if ($windows.Count -gt 0) {
+            Write-Step "🛡 Santé des postes : état Defender de $($windows.Count) poste(s) Windows (lots de 20)..."
+            $requests = foreach ($d in $windows) { @{ id = [string]$d.Id; method = "GET"; url = "/deviceManagement/managedDevices/$($d.Id)/windowsProtectionState" } }
+            try {
+                $denied = 0
+                foreach ($r in @(Invoke-GraphBatch -Requests @($requests) -AccessToken $AccessToken -Label "État Defender")) {
+                    $st = 0
+                    try { $st = [int]$r.status } catch { }
+                    if ($st -eq 200 -and $r.body) { $defender[[string]$r.id] = $r.body }
+                    elseif ($st -in @(401, 403)) { $denied++ }
+                }
+                if ($denied -gt 0) { $Warnings.Add("État Defender : accès refusé pour $denied poste(s) (permission DeviceManagementManagedDevices.Read.All).") }
+                Write-Log "État Defender : $($defender.Count) poste(s) sur $($windows.Count)."
+            } catch {
+                $Warnings.Add("État Defender indisponible : $($_.Exception.Message)")
+            }
+        }
+    }
+
+    # ----- Mises à jour qualité Windows (rapport asynchrone) -----
+    $updateFailures = @()
+    if ($Checks.WindowsUpdate) {
+        Write-Step "🔄 Santé des postes : rapport des mises à jour qualité Windows..."
+        try { $updateFailures = @(Get-WindowsUpdateFailures -AccessToken $AccessToken) }
+        catch { $Warnings.Add("Mises à jour Windows : $($_.Exception.Message). Prérequis : postes rattachés à une stratégie de mises à jour qualité Windows.") }
+    }
+
+    # ----- Profils de configuration en erreur / conflit -----
+    $configErrors = @()
+    if ($Checks.ConfigProfile) {
+        try { $configErrors = @(Get-ConfigurationProfileErrors -DeviceConfigurations $DeviceConfigurations -AccessToken $AccessToken -MaxProfiles $MaxConfigProfilesAnalyzed -Warnings $Warnings) }
+        catch { $Warnings.Add("Profils de configuration indisponibles : $($_.Exception.Message)") }
+    }
+
+    return [pscustomobject]@{
+        Scores              = @(Get-CollectedItems -Bag $collected -Name "Scores Endpoint Analytics")
+        Performance         = @(Get-CollectedItems -Bag $collected -Name "Performances de démarrage")
+        Battery             = @(Get-CollectedItems -Bag $collected -Name "Santé des batteries")
+        AppReliability      = @(Get-CollectedItems -Bag $collected -Name "Fiabilité des applications")
+        StartupHistory      = @(Get-CollectedItems -Bag $collected -Name "Historique de démarrage")
+        BitLocker           = @(Get-CollectedItems -Bag $collected -Name "État BitLocker")
+        Defender            = $defender
+        UpdateFailures      = $updateFailures
+        ConfigProfileErrors = $configErrors
+    }
+}
+
+function New-HealthIssue([string]$Label, [string]$Sev, [string]$Detail) {
+    return [pscustomobject]@{ Label = $Label; Sev = $Sev; Detail = $Detail }
+}
+
+# Nombre au format français pour les libellés ("12,5")
+function Format-FrNumber($Value) { return ("$Value" -replace '\.', ',') }
+
+# [FUSION v4 - Proactivité] Croise appareils et données de santé, en déduit par poste
+# les indicateurs, une sévérité (crit / warn / ok) et des ACTIONS DE REMÉDIATION
+# regroupées (une action -> la liste des postes concernés).
+function Build-RemediationData {
+    param(
+        [object[]]$Devices, [object]$Health, [hashtable]$Checks,
+        [hashtable]$ComplianceReasonsById = @{}, [bool]$AnonymizeData = $false
+    )
+    $T    = $RemediationThresholds
+    $rank = $HealthSeverityRank
+
+    $scoreByName = New-NameIndex -Items $Health.Scores      -NameProps @('deviceName')
+    $perfByName  = New-NameIndex -Items $Health.Performance -NameProps @('deviceName')
+    $blByName    = New-NameIndex -Items $Health.BitLocker   -NameProps @('deviceName')
+    $battByName  = New-NameIndex -Items $Health.Battery     -NameProps @('deviceName', 'deviceDisplayName')
+
+    # Fiabilité applicative : par poste, l'application qui plante le plus souvent
+    $crashCounts = @{}
+    foreach ($e in @($Health.AppReliability)) {
+        if ($null -eq $e -or "$($e.eventType)" -notmatch '(?i)crash|hang') { continue }
+        $k = Get-DeviceNameKey ([string](Get-PropValue $e @('deviceDisplayName', 'deviceName')))
+        if (-not $k) { continue }
+        if (-not $crashCounts.ContainsKey($k)) { $crashCounts[$k] = @{} }
+        $app = [string]$e.appDisplayName
+        if (-not $crashCounts[$k].ContainsKey($app)) { $crashCounts[$k][$app] = 0 }
+        $crashCounts[$k][$app]++
+    }
+    $crashByName = @{}
+    foreach ($k in @($crashCounts.Keys)) {
+        $top = $crashCounts[$k].GetEnumerator() | Sort-Object Value -Descending | Select-Object -First 1
+        if ($top) { $crashByName[$k] = [pscustomobject]@{ AppName = [string]$top.Key; Count = [int]$top.Value } }
+    }
+
+    # Dernier démarrage connu : par deviceId / startTime (schéma Graph documenté), puis par nom
+    $bootById   = @{}
+    $bootByName = @{}
+    foreach ($h in @($Health.StartupHistory)) {
+        if ($null -eq $h) { continue }
+        $dt = ConvertTo-UtcDate (Get-PropValue $h @('startTime', 'startupDateTime', 'eventDateTime', 'lastBootUpTime'))
+        if (-not $dt) { continue }
+        $id = "$(Get-PropValue $h @('deviceId', 'managedDeviceId'))".ToLowerInvariant()
+        if ($id -and (-not $bootById.ContainsKey($id) -or $dt -gt $bootById[$id])) { $bootById[$id] = $dt }
+        $k = Get-DeviceNameKey ([string](Get-PropValue $h @('deviceName', 'deviceDisplayName')))
+        if ($k -and (-not $bootByName.ContainsKey($k) -or $dt -gt $bootByName[$k])) { $bootByName[$k] = $dt }
+    }
+
+    # Profils de configuration en échec, regroupés par poste (au plus 6 noms conservés)
+    $cfgByName = @{}
+    foreach ($e in @($Health.ConfigProfileErrors)) {
+        if ($null -eq $e) { continue }
+        $k = Get-DeviceNameKey $e.DeviceName
+        if (-not $k) { continue }
+        if (-not $cfgByName.ContainsKey($k)) {
+            $cfgByName[$k] = [pscustomobject]@{ Count = 0; Profiles = [System.Collections.Generic.List[string]]::new(); HasConflict = $false }
+        }
+        $c = $cfgByName[$k]
+        $c.Count += 1
+        if ($c.Profiles.Count -lt 6 -and $e.ProfileName) { $c.Profiles.Add([string]$e.ProfileName) }
+        if ($e.Status -eq 'conflict') { $c.HasConflict = $true }
+    }
+
+    # Mises à jour qualité en échec : colonnes du rapport cherchées sous plusieurs graphies
+    $updByName = @{}
+    foreach ($u in @($Health.UpdateFailures)) {
+        if ($null -eq $u) { continue }
+        $state = [string](Get-PropValue $u @('AggregateState', 'CurrentDeviceUpdateStatus', 'UpdateStatus', 'status'))
+        if ($state -notmatch '(?i)error|fail|cancel') { continue }
+        $k = Get-DeviceNameKey ([string](Get-PropValue $u @('DeviceName', 'Device', 'deviceDisplayName')))
+        if (-not $k -or $updByName.ContainsKey($k)) { continue }
+        $updByName[$k] = [pscustomobject]@{ State = $state; Message = [string](Get-PropValue $u @('LatestAlertMessage', 'ErrorCode')) }
+    }
+
+    # Un même nom de poste peut correspondre à plusieurs enregistrements Intune (réimagé,
+    # ré-enrôlé...). On garde l'enregistrement le plus récemment synchronisé : garder "le
+    # premier rencontré" produisait de faux positifs "inactif depuis N jours".
+    $byName   = [ordered]@{}
+    $dupCount = 0
+    foreach ($d in @($Devices)) {
+        if ($null -eq $d) { continue }
+        $k = Get-DeviceNameKey $d.DeviceName
+        if (-not $k) { continue }
+        if (-not $byName.Contains($k)) { $byName[$k] = $d; continue }
+        $dupCount++
+        $kept = $byName[$k]
+        if ($d.LastSyncDateTime -and (-not $kept.LastSyncDateTime -or $d.LastSyncDateTime -gt $kept.LastSyncDateTime)) { $byName[$k] = $d }
+    }
+    if ($dupCount -gt 0) {
+        Write-Log "Santé des postes : $dupCount enregistrement(s) en doublon de nom de poste ; le plus récemment synchronisé a été conservé (doublons à nettoyer dans Intune)." -Level WARN
+    }
+
+    $nowUtc  = [datetime]::UtcNow
+    $rows    = [System.Collections.Generic.List[object]]::new()
+    $actions = [ordered]@{}
+
+    foreach ($k in @($byName.Keys)) {
+        $d      = $byName[$k]
+        $sc     = $scoreByName[$k]
+        $pf     = $perfByName[$k]
+        $bl     = $blByName[$k]
+        $bh     = $battByName[$k]
+        $dv     = if ($Health.Defender) { $Health.Defender[[string]$d.Id] } else { $null }
+        $crash  = $crashByName[$k]
+        $cfg    = $cfgByName[$k]
+        $upd    = $updByName[$k]
+        $issues = [System.Collections.Generic.List[object]]::new()
+
+        # ----- Espace disque -----
+        $freeGB = $null; $totGB = $null; $freePct = $null; $diskSev = $null
+        if ($null -ne $d.FreeStorageSpaceInBytes) { $freeGB = [math]::Round($d.FreeStorageSpaceInBytes / 1GB, 1) }
+        if ($d.TotalStorageSpaceInBytes -gt 0) {
+            $totGB = [math]::Round($d.TotalStorageSpaceInBytes / 1GB, 1)
+            if ($null -ne $d.FreeStorageSpaceInBytes) { $freePct = [int][math]::Round(100.0 * $d.FreeStorageSpaceInBytes / $d.TotalStorageSpaceInBytes) }
+        }
+        if ($Checks.Disk -and $null -ne $freePct) {
+            $txt = "$(Format-FrNumber $freeGB) Go libres sur $(Format-FrNumber $totGB) Go ($freePct %)"
+            if ($freePct -lt $T.DiskFreePctCritical -or ($null -ne $freeGB -and $freeGB -lt $T.DiskFreeGbCritical)) {
+                $diskSev = 'crit'
+                $issues.Add((New-HealthIssue "Libérer de l'espace disque (moins de $($T.DiskFreePctCritical) % ou $($T.DiskFreeGbCritical) Go libres)" 'crit' $txt))
+            } elseif ($freePct -lt $T.DiskFreePctWarning) {
+                $diskSev = 'warn'
+                $issues.Add((New-HealthIssue "Espace disque à surveiller (moins de $($T.DiskFreePctWarning) % libres)" 'warn' $txt))
+            }
+        }
+
+        # ----- Inactivité -----
+        $daysSince = $null
+        if ($d.LastSyncDateTime) { $daysSince = [int][math]::Floor(($nowUtc - $d.LastSyncDateTime).TotalDays) }
+        if ($Checks.Inactivity -and $null -ne $daysSince) {
+            if ($daysSince -ge $T.StaleDaysCritical) {
+                $issues.Add((New-HealthIssue "Appareil inactif depuis plus de $($T.StaleDaysCritical) jours - reprendre contact ou retirer d'Intune" 'crit' "$daysSince jours sans synchronisation"))
+            } elseif ($daysSince -ge $T.StaleDaysWarning) {
+                $issues.Add((New-HealthIssue "Appareil sans synchronisation depuis plus de $($T.StaleDaysWarning) jours" 'warn' "$daysSince jours sans synchronisation"))
+            }
+        }
+
+        # ----- Scores Endpoint Analytics & démarrage -----
+        $analytics = ConvertTo-NullableDouble (Get-PropValue $sc @('endpointAnalyticsScore')) -NonNegative
+        $battScore = ConvertTo-NullableDouble (Get-PropValue $sc @('batteryHealthScore')) -NonNegative
+        $bootSec = $null; $bootScore = $null; $bsod = $null; $restarts = $null; $diskType = ""
+        if ($pf) {
+            $ms = ConvertTo-NullableDouble $pf.coreBootTimeInMs -NonNegative
+            if ($ms -gt 0) { $bootSec = [int][math]::Round($ms / 1000) }
+            $bootScore = ConvertTo-NullableDouble $pf.bootScore -NonNegative
+            $bsod      = ConvertTo-NullableLong $pf.blueScreenCount
+            $restarts  = ConvertTo-NullableLong $pf.restartCount
+            $diskType  = "$($pf.diskType)".Trim()
+        }
+        if ($Checks.Bsod) {
+            if ($bsod -gt 0) {
+                $sev = if ($bsod -ge $T.BsodCritical) { 'crit' } else { 'warn' }
+                $det = "$bsod écran(s) bleu(s) sur 14 jours"
+                if ($null -ne $restarts) { $det += ", $restarts redémarrage(s)" }
+                $issues.Add((New-HealthIssue "Écrans bleus (BSOD) récents - analyser pilotes et matériel" $sev $det))
+            } elseif ($restarts -ge $T.RestartsHigh) {
+                $issues.Add((New-HealthIssue "Redémarrages anormalement fréquents" 'warn' "$restarts redémarrage(s) sur 14 jours"))
+            }
+        }
+        if ($Checks.Boot -and $bootSec -ge $T.BootSlowSeconds) {
+            $det = "Démarrage en $bootSec s"
+            if ($null -ne $bootScore) { $det += " (score $([int]$bootScore))" }
+            $issues.Add((New-HealthIssue "Démarrage lent (plus de $($T.BootSlowSeconds) s) - alléger le démarrage" 'warn' $det))
+        }
+        if ($Checks.Boot -and $diskType -match '(?i)hdd') {
+            $det = "Disque mécanique (HDD)"
+            if ($null -ne $bootSec) { $det += " - démarrage $bootSec s" }
+            $issues.Add((New-HealthIssue "Disque mécanique (HDD) - envisager un remplacement SSD" 'warn' $det))
+        }
+        if ($Checks.Battery -and $null -ne $battScore -and $battScore -lt $T.BatteryPoor) {
+            $issues.Add((New-HealthIssue "Batterie dégradée (score sous $($T.BatteryPoor)) - prévoir un remplacement" 'warn' "Score batterie $([int]$battScore)"))
+        }
+        if ($Checks.EaScore -and $null -ne $analytics -and $analytics -lt $T.ScoreLow) {
+            $issues.Add((New-HealthIssue "Score Endpoint Analytics faible (sous $($T.ScoreLow))" 'warn' "Score global $([int]$analytics)"))
+        }
+
+        # ----- BitLocker -----
+        # advancedBitLockerStates est un enum "flags" sérialisé en texte ("tpmNotReady,
+        # loggedOnUserNonAdmin"). Tous les indicateurs ne sont pas des défauts :
+        # loggedOnUserNonAdmin (utilisateur non administrateur) est une BONNE pratique ;
+        # le compter comme une erreur produisait une majorité de faux positifs.
+        if ($Checks.BitLocker -and $bl) {
+            $encState      = "$($bl.encryptionState)"
+            $flags         = @("$($bl.advancedBitLockerStates)" -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ -and $_ -ne 'success' })
+            $criticalFlags = @('osVolumeUnprotected', 'recoveryKeyBackupFailed', 'fixedDriveNotEncrypted', 'tpmNotAvailable', 'tpmNotReady')
+            $ignoredFlags  = @('noUserConsent', 'loggedOnUserNonAdmin')
+            $relevant      = @($flags | Where-Object { $_ -notin $ignoredFlags })
+            if ($encState -eq 'notEncrypted') {
+                $issues.Add((New-HealthIssue "BitLocker désactivé - chiffrer le poste" 'crit' "Volume système non chiffré"))
+            } elseif ($relevant.Count -gt 0) {
+                if (@($relevant | Where-Object { $_ -in $criticalFlags }).Count -gt 0) {
+                    $issues.Add((New-HealthIssue "BitLocker en échec réel - protection du volume compromise" 'crit' ($relevant -join ', ')))
+                } else {
+                    $issues.Add((New-HealthIssue "BitLocker : écart de stratégie à vérifier (non bloquant)" 'warn' ($relevant -join ', ')))
+                }
+            }
+        }
+
+        # ----- Defender -----
+        if ($Checks.Defender -and $dv) {
+            if ($dv.realTimeProtectionEnabled -eq $false) {
+                $issues.Add((New-HealthIssue "Protection en temps réel Defender désactivée" 'crit' "realTimeProtectionEnabled = false"))
+            }
+            if ($dv.signatureUpdateOverdue -eq $true) {
+                $sigDet = "Signatures en retard"
+                $lastReport = ConvertTo-UtcDate $dv.lastReportedDateTime
+                if ($lastReport) { $sigDet += " (dernier rapport : $(Format-LocalDate $lastReport))" }
+                $issues.Add((New-HealthIssue "Signatures antivirus en retard (plus de $($T.SignatureStaleDays) jours)" 'warn' $sigDet))
+            }
+        }
+
+        # ----- Fiabilité applicative -----
+        if ($Checks.AppReliability -and $crash -and $crash.Count -ge $T.AppCrashWarning) {
+            $issues.Add((New-HealthIssue "Application qui plante fréquemment - réinstaller ou mettre à jour" 'warn' "$($crash.AppName) : $($crash.Count) plantage(s)"))
+        }
+
+        # ----- Uptime (estimation via le dernier démarrage connu) -----
+        $lastBoot = $bootById["$($d.Id)".ToLowerInvariant()]
+        if (-not $lastBoot) { $lastBoot = $bootByName[$k] }
+        $uptimeDays = if ($lastBoot) { [int][math]::Floor(($nowUtc - $lastBoot).TotalDays) } else { $null }
+        if ($Checks.Uptime -and $null -ne $uptimeDays -and $uptimeDays -ge $T.UptimeWarningDays) {
+            $issues.Add((New-HealthIssue "Poste non redémarré depuis longtemps (estimation) - planifier un redémarrage" 'warn' "~$uptimeDays jour(s) depuis le dernier démarrage détecté"))
+        }
+
+        # ----- Conformité Intune (motif repris de l'analyse des non-conformités) -----
+        $compState = "$($d.ComplianceState)".Trim()
+        if ($Checks.Compliance -and $compState) {
+            $reason = $ComplianceReasonsById[[string]$d.Id]
+            switch -Regex ($compState) {
+                '(?i)^noncompliant$' {
+                    $det = if ($reason) { $reason } else { "État Intune : non conforme (motif non analysé dans cette génération)" }
+                    $issues.Add((New-HealthIssue "Non conforme aux stratégies de conformité Intune" 'crit' $det))
+                }
+                '(?i)^inGracePeriod$' {
+                    $issues.Add((New-HealthIssue "En période de grâce - à traiter avant bascule en non conforme" 'warn' "État Intune : période de grâce avant bascule en non conforme"))
+                }
+                '(?i)^(error|conflict)$' {
+                    $issues.Add((New-HealthIssue "Évaluation de conformité en erreur ou en conflit" 'warn' "État Intune : $compState"))
+                }
+            }
+        }
+
+        # ----- Profils de configuration en erreur / conflit -----
+        if ($Checks.ConfigProfile -and $cfg -and $cfg.Count -gt 0) {
+            $names = @($cfg.Profiles | Select-Object -First 3)
+            $det   = "$($cfg.Count) profil(s) en échec"
+            if ($names.Count -gt 0) { $det += " : " + ($names -join ' ; ') }
+            if ($cfg.Count -gt $names.Count) { $det += " ..." }
+            if ($cfg.Count -ge $T.ConfigErrorsCritical) {
+                $issues.Add((New-HealthIssue "Profils de configuration en échec ($($T.ConfigErrorsCritical) ou plus) - paramétrage non appliqué" 'crit' $det))
+            } elseif ($cfg.HasConflict) {
+                $issues.Add((New-HealthIssue "Conflit entre profils de configuration - deux stratégies se contredisent" 'warn' $det))
+            } else {
+                $issues.Add((New-HealthIssue "Profil de configuration en erreur - paramétrage non appliqué" 'warn' $det))
+            }
+        }
+
+        # ----- Batterie : capacité, âge, autonomie (valeurs négatives = non mesuré) -----
+        $battCapacity = $null; $battAgeDays = $null; $battRuntime = $null
+        if ($bh) {
+            $battCapacity = ConvertTo-NullableDouble (Get-PropValue $bh @('maxCapacityPercentage', 'maxCapacityPercent')) -NonNegative
+            $battAgeDays  = ConvertTo-NullableDouble (Get-PropValue $bh @('batteryAgeInDays')) -NonNegative
+            $battRuntime  = ConvertTo-NullableDouble (Get-PropValue $bh @('estimatedRuntimeInMinutes')) -NonNegative
+            if ($battCapacity -eq 0) { $battCapacity = $null }
+            if ($battRuntime -eq 0)  { $battRuntime = $null }
+        }
+        if ($Checks.BatteryDetail -and $null -ne $battCapacity -and $battCapacity -lt $T.BatteryCapacityPoor) {
+            $det = "Capacité maximale restante : $([int]$battCapacity) %"
+            if ($null -ne $battAgeDays) { $det += " - batterie âgée de ~$([int][math]::Round($battAgeDays / 365.0, 0)) an(s)" }
+            if ($null -ne $battRuntime) { $det += " - autonomie estimée $([int]$battRuntime) min" }
+            if ($battCapacity -lt $T.BatteryCapacityCrit) {
+                $issues.Add((New-HealthIssue "Batterie hors d'usage (capacité sous $($T.BatteryCapacityCrit) %) - remplacement à planifier" 'crit' $det))
+            } else {
+                $issues.Add((New-HealthIssue "Batterie usée (capacité sous $($T.BatteryCapacityPoor) %) - remplacement à prévoir" 'warn' $det))
+            }
+        } elseif ($Checks.BatteryDetail -and $null -ne $battRuntime -and $battRuntime -lt $T.BatteryRuntimeLowMin -and $null -ne $battCapacity) {
+            $issues.Add((New-HealthIssue "Autonomie insuffisante (moins de $($T.BatteryRuntimeLowMin) min) - poste devenu sédentaire" 'warn' "Autonomie estimée $([int]$battRuntime) min pour $([int]$battCapacity) % de capacité"))
+        }
+
+        # ----- Mises à jour qualité Windows en échec -----
+        if ($Checks.WindowsUpdate -and $upd) {
+            $det = "État : $($upd.State)"
+            if ($upd.Message) { $det += " - $($upd.Message)" }
+            $issues.Add((New-HealthIssue "Mise à jour qualité Windows en échec - poste privé de correctifs de sécurité" 'crit' $det))
+        }
+
+        # ----- Sévérité globale du poste -----
+        $sevMax = 0
+        foreach ($i in $issues) { if ($rank[$i.Sev] -gt $sevMax) { $sevMax = $rank[$i.Sev] } }
+        $severity = @('ok', 'warn', 'crit')[$sevMax]
+
+        # ----- Anonymisation : mêmes alias que dans toutes les autres pages -----
+        $name = $d.DeviceName
+        $upn  = $d.UserPrincipalName
+        if ($AnonymizeData) {
+            $anon = Get-AnonymizedIdentity -RealName $name -RealUpn $upn
+            $name = $anon.Name
+            $upn  = $anon.Upn
+        }
+
+        foreach ($i in $issues) {
+            if (-not $actions.Contains($i.Label)) {
+                $actions[$i.Label] = [pscustomobject]@{ Severity = $i.Sev; Devices = [System.Collections.Generic.List[object]]::new() }
+            }
+            $a = $actions[$i.Label]
+            if ($rank[$i.Sev] -gt $rank[$a.Severity]) { $a.Severity = $i.Sev }
+            $a.Devices.Add([pscustomobject]@{
+                DeviceName        = $name
+                UserPrincipalName = $upn
+                OperatingSystem   = $d.OperatingSystem
+                Detail            = $i.Detail
+                LastSyncDateTime  = $d.LastSyncDateTime
+            })
+        }
+
+        $rows.Add([pscustomobject]@{
+            Severity          = $severity
+            DeviceName        = $name
+            UserPrincipalName = $upn
+            OperatingSystem   = $d.OperatingSystem
+            OSVersion         = $d.OSVersion
+            FreeGB            = $freeGB
+            TotalGB           = $totGB
+            FreePct           = $freePct
+            DiskSeverity      = $diskSev
+            AnalyticsScore    = $analytics
+            BootSeconds       = $bootSec
+            DiskType          = $diskType
+            BlueScreens       = $bsod
+            Restarts          = $restarts
+            BatteryScore      = $battScore
+            BatteryCapacity   = $battCapacity
+            BatteryAgeDays    = $battAgeDays
+            BatteryRuntimeMin = $battRuntime
+            BitLockerState    = if ($bl) { "$($bl.encryptionState)" } else { $null }
+            DefenderRealTime  = if ($dv) { $dv.realTimeProtectionEnabled } else { $null }
+            DefenderSigStale  = if ($dv) { $dv.signatureUpdateOverdue } else { $null }
+            CrashApp          = if ($crash) { $crash.AppName } else { $null }
+            CrashCount        = if ($crash) { $crash.Count } else { $null }
+            UptimeDays        = $uptimeDays
+            ComplianceState   = $compState
+            ConfigErrorCount  = if ($cfg) { $cfg.Count } else { $null }
+            ConfigErrorNames  = if ($cfg) { (@($cfg.Profiles) -join ' ; ') } else { $null }
+            UpdateFailure     = if ($upd) { $upd.State } else { $null }
+            LastSyncDateTime  = $d.LastSyncDateTime
+            DaysSinceSync     = $daysSince
+            Issues            = (@($issues | ForEach-Object { $_.Label }) -join ' | ')
+            DeviceId          = [string]$d.Id
+        })
+    }
+
+    $sorted   = @($rows | Sort-Object @{ Expression = { $rank[$_.Severity] }; Descending = $true }, @{ Expression = { $_.DeviceName } })
+    $crit     = @($sorted | Where-Object { $_.Severity -eq 'crit' }).Count
+    $warn     = @($sorted | Where-Object { $_.Severity -eq 'warn' }).Count
+    $avgScore = $null
+    $scored   = @($sorted | Where-Object { $null -ne $_.AnalyticsScore })
+    if ($scored.Count -gt 0) { $avgScore = [int][math]::Round(($scored | Measure-Object -Property AnalyticsScore -Average).Average) }
+
+    return [pscustomobject]@{
+        Rows           = $sorted
+        Actions        = $actions
+        CritCount      = $crit
+        WarnCount      = $warn
+        OkCount        = $sorted.Count - $crit - $warn
+        AvgScore       = $avgScore
+        DuplicateNames = $dupCount
+    }
+}
+
+# Actions triées par sévérité puis nombre de postes
+function Get-SortedHealthActions {
+    param($Actions)
+    if (-not $Actions -or $Actions.Count -eq 0) { return @() }
+    return @($Actions.GetEnumerator() | Sort-Object @{ Expression = { $HealthSeverityRank[$_.Value.Severity] }; Descending = $true },
+                                                    @{ Expression = { $_.Value.Devices.Count }; Descending = $true },
+                                                    @{ Expression = { $_.Key } })
+}
+
+# Synthèse des actions (tableau, graphique et CSV)
+function Get-HealthActionSummary {
+    param($Actions)
+    foreach ($entry in (Get-SortedHealthActions -Actions $Actions)) {
+        [pscustomobject][ordered]@{
+            'Sévérité'           = $HealthSeverityLabels[$entry.Value.Severity]
+            'Action recommandée' = $entry.Key
+            'Postes concernés'   = $entry.Value.Devices.Count
+        }
+    }
+}
+
+# Détail action x poste (tableau et CSV)
+function Select-HealthActionDetailView {
+    param($Actions)
+    foreach ($entry in (Get-SortedHealthActions -Actions $Actions)) {
+        foreach ($dev in $entry.Value.Devices) {
+            [pscustomobject][ordered]@{
+                'Sévérité'           = $HealthSeverityLabels[$entry.Value.Severity]
+                'Action recommandée' = $entry.Key
+                'Poste'              = $dev.DeviceName
+                'Utilisateur (UPN)'  = $dev.UserPrincipalName
+                'OS'                 = $dev.OperatingSystem
+                'Détail'             = $dev.Detail
+                'Dernière synchro'   = Format-LocalDate $dev.LastSyncDateTime
+            }
+        }
+    }
+}
+
+# Vue "un poste, tous ses indicateurs" (tableau et CSV)
+function Select-HealthDeviceView {
+    param([object[]]$Rows)
+    $yesNo = { param($v) if ($null -eq $v) { "" } elseif ($v -eq $true) { "Oui" } else { "Non" } }
+    foreach ($r in $Rows) {
+        [pscustomobject][ordered]@{
+            'Sévérité'               = $HealthSeverityLabels[$r.Severity]
+            'Poste'                  = $r.DeviceName
+            'Utilisateur (UPN)'      = $r.UserPrincipalName
+            'OS'                     = $r.OperatingSystem
+            'Version OS'             = $r.OSVersion
+            'Disque libre (Go)'      = $r.FreeGB
+            'Disque total (Go)'      = $r.TotalGB
+            'Disque libre (%)'       = $r.FreePct
+            'Score Endpoint Analytics' = $r.AnalyticsScore
+            'Démarrage (s)'          = $r.BootSeconds
+            'Type de disque'         = $r.DiskType
+            'Écrans bleus (14 j)'    = $r.BlueScreens
+            'Redémarrages (14 j)'    = $r.Restarts
+            'Score batterie'         = $r.BatteryScore
+            'Capacité batterie (%)'  = $r.BatteryCapacity
+            'Autonomie (min)'        = $r.BatteryRuntimeMin
+            'BitLocker'              = $r.BitLockerState
+            'Defender temps réel'    = & $yesNo $r.DefenderRealTime
+            'Signatures en retard'   = & $yesNo $r.DefenderSigStale
+            'Application instable'   = $r.CrashApp
+            'Plantages'              = $r.CrashCount
+            'Uptime estimé (j)'      = $r.UptimeDays
+            'Conformité'             = ConvertTo-NcStateLabel $r.ComplianceState
+            'Profils en échec'       = $r.ConfigErrorCount
+            'Mise à jour en échec'   = $r.UpdateFailure
+            'Dernière synchro'       = Format-LocalDate $r.LastSyncDateTime
+            'Jours sans synchro'     = $r.DaysSinceSync
+            'Actions recommandées'   = $r.Issues
+        }
+    }
+}
+
+# Postes à l'espace disque insuffisant (remplace la liste "Low Storage < 100 GB" de la v3)
+function Select-HealthDiskView {
+    param([object[]]$Rows)
+    foreach ($r in @($Rows | Where-Object { $_.DiskSeverity } | Sort-Object FreePct)) {
+        [pscustomobject][ordered]@{
+            'Sévérité'          = $HealthSeverityLabels[$r.DiskSeverity]
+            'Poste'             = $r.DeviceName
+            'Utilisateur (UPN)' = $r.UserPrincipalName
+            'OS'                = $r.OperatingSystem
+            'Disque libre (Go)' = $r.FreeGB
+            'Disque total (Go)' = $r.TotalGB
+            'Disque libre (%)'  = $r.FreePct
+            'Type de disque'    = $r.DiskType
+            'Dernière synchro'  = Format-LocalDate $r.LastSyncDateTime
+        }
+    }
+}
+
+# Bloc d'en-tête de la page "Santé & proactivité" : KPI, lecture, avertissements
+function New-HealthDashboardHeadHtml {
+    param([object]$Data, [System.Collections.Generic.List[string]]$Warnings, [int]$ActiveChecks = 0)
+
+    $esc = { param($Text) ((ConvertTo-HtmlSafe $Text) -replace '\[', '&#91;') -replace '\]', '&#93;' }
+    $warnHtml = ""
+    if ($Warnings -and $Warnings.Count -gt 0) {
+        $items    = ($Warnings | ForEach-Object { "<li>$(& $esc $_)</li>" }) -join ''
+        $warnHtml = "<div class=`"ix-root ix-note ix-note--warn`">$(Get-IconSvg -Name 'alert' -Size 18)<div><strong>Données partiellement disponibles</strong><ul>$items</ul></div></div>"
+    }
+    if (-not $Data -or @($Data.Rows).Count -eq 0) {
+        return (New-IxEmptyState -Icon 'gauge' -Tone 'neutral' -Title "Aucun poste à analyser" -Text "Aucun appareil du périmètre n'a pu être évalué.") + $warnHtml
+    }
+
+    $total = @($Data.Rows).Count
+    $avg   = if ($null -ne $Data.AvgScore) { "$($Data.AvgScore)" } else { "&mdash;" }
+    $cards = [System.Text.StringBuilder]::new()
+    [void]$cards.Append((New-IxStatCard -Label 'Postes analysés' -Value $total -Icon 'monitor' -Color $Colors.Secondary -Caption "$ActiveChecks vérification(s) active(s)"))
+    [void]$cards.Append((New-IxStatCard -Label 'Critiques' -Value $Data.CritCount -Icon 'x-circle' -Color $Colors.Danger -Caption "<b>$(Get-IxPercent $Data.CritCount $total) %</b> du parc - à traiter en priorité"))
+    [void]$cards.Append((New-IxStatCard -Label 'À surveiller' -Value $Data.WarnCount -Icon 'alert' -Color $Colors.Warning -Caption "<b>$(Get-IxPercent $Data.WarnCount $total) %</b> du parc"))
+    [void]$cards.Append((New-IxStatCard -Label 'Sans alerte' -Value $Data.OkCount -Icon 'shield-ok' -Color $Colors.Success -Caption "Tous les indicateurs dans les seuils"))
+    [void]$cards.Append((New-IxStatCard -Label 'Score Endpoint Analytics moyen' -Value $avg -Icon 'gauge' -Color $Colors.Accent -Caption "Sur 100, postes mesurés uniquement"))
+
+    $note = "<div class=`"ix-root ix-note`">$(Get-IconSvg -Name 'info' -Size 18)<div><strong>Lecture :</strong> " +
+            "chaque poste reçoit la sévérité de sa pire alerte ; les actions recommandées regroupent les postes concernés. " +
+            "Les données Endpoint Analytics (scores, démarrages, batteries, plantages) sont agrégées quotidiennement par Microsoft " +
+            "et nécessitent que l'Analyse des points de terminaison soit activée ; l'uptime est une estimation. " +
+            "Seuils modifiables en tête de script (`$RemediationThresholds).</div></div>"
+
+    return "<div class=`"ix-root ix-overview`">$($cards.ToString())</div>" + $note + $warnHtml
+}
+
+# ========================================
+# [v4.0] EXPORTS CSV (TOUTES LES SECTIONS)
+# ========================================
+# Un dossier horodaté par génération, un fichier par jeu de données collecté.
+# Séparateur ";" et UTF-8 avec BOM (ouverture directe dans Excel en français) ;
+# dates en heure locale "JJ/MM/AAAA HH:MM", décimaux selon la culture du poste,
+# booléens Oui / Non, listes jointes par " | ". Données anonymisées si l'option
+# est cochée (comme le rapport HTML).
+
+function Export-CsvFile {
+    param([object[]]$Rows, [string]$Path)
+    $culture = [Globalization.CultureInfo]::CurrentCulture
+    $out = foreach ($r in @($Rows)) {
+        if ($null -eq $r) { continue }
+        $o = [ordered]@{}
+        foreach ($p in $r.PSObject.Properties) {
+            $v = $p.Value
+            if ($v -is [datetime]) { $v = Format-LocalDate $v }
+            elseif ($v -is [double] -or $v -is [single] -or $v -is [decimal]) { $v = $v.ToString($culture) }
+            elseif ($v -is [bool]) { $v = if ($v) { "Oui" } else { "Non" } }
+            elseif ($null -ne $v -and $v -isnot [string] -and $v -is [System.Collections.IEnumerable]) { $v = (@($v) | ForEach-Object { "$_" }) -join ' | ' }
+            $o[$p.Name] = $v
+        }
+        [pscustomobject]$o
+    }
+    $lines = [string[]]@($out | ConvertTo-Csv -NoTypeInformation -Delimiter $NcCsvDelimiter)
+    [System.IO.File]::WriteAllLines($Path, $lines, [System.Text.UTF8Encoding]::new($true))
+}
+
+# Écrit chaque jeu de données ; un échec (fichier ouvert dans Excel, droits...) devient
+# un avertissement sans bloquer les autres. Jeu vide : pas de fichier.
+function Export-AllDatasets {
+    param([System.Collections.Specialized.OrderedDictionary]$Datasets, [string]$Folder, [System.Collections.Generic.List[string]]$Warnings)
+    $written = [System.Collections.Generic.List[string]]::new()
+    try {
+        if (-not (Test-Path -LiteralPath $Folder)) { New-Item -ItemType Directory -Path $Folder -Force -ErrorAction Stop | Out-Null }
+    } catch {
+        $Warnings.Add("Export CSV impossible : le dossier « $Folder » n'a pas pu être créé ($($_.Exception.Message)).")
+        return @()
+    }
+    foreach ($name in @($Datasets.Keys)) {
+        $rows = @($Datasets[$name] | Where-Object { $null -ne $_ })
+        if ($rows.Count -eq 0) { Write-Log "CSV « $name » : aucune donnée, fichier non créé."; continue }
+        $path = Join-Path $Folder ("{0}.csv" -f ($name -replace '[\\/:*?"<>|]', '_'))
+        try {
+            Export-CsvFile -Rows $rows -Path $path
+            $written.Add($path)
+        } catch {
+            $Warnings.Add("Export CSV « $name » en échec : $($_.Exception.Message)")
+        }
+    }
+    Write-Log "Export CSV : $($written.Count) fichier(s) dans $Folder" -Level OK
+    return $written.ToArray()
+}
+
+# ========================================
 # INSTALLATION DES MODULES
 # ========================================
+# [v4.0] Seul PSWriteHTML reste nécessaire, et uniquement si le rapport HTML est
+# demandé : toute la collecte passe par l'API REST (le module Microsoft.Graph, dont
+# l'import complet est lent et peut dépasser la limite de 4 096 fonctions de
+# Windows PowerShell 5.1, n'est plus utilisé).
 
 function Install-RequiredModules {
-    $lblStatus.Text = "🔍 Vérification des modules PowerShell..."; $form.Refresh()
-    $missingModules = @()
-    if (-not (Get-Module -Name PSWriteHTML    -ListAvailable)) { $missingModules += "PSWriteHTML" }
-    if (-not (Get-Module -Name Microsoft.Graph -ListAvailable)) { $missingModules += "Microsoft.Graph" }
+    param([string[]]$Modules = @("PSWriteHTML"))
+    Write-Step "🔍 Vérification des modules PowerShell..."
+    $missingModules = @($Modules | Where-Object { -not (Get-Module -Name $_ -ListAvailable) })
     if ($missingModules.Count -eq 0) { return $true }
 
     $lblStatus.Text = "⚠ Modules manquants détectés"; $lblStatus.ForeColor = [System.Drawing.Color]::Red; $form.Refresh()
     $moduleList = $missingModules -join ", "
-    $message = "Modules PowerShell manquants : $moduleList`n`nCes modules sont nécessaires pour générer le dashboard.`n`nVoulez-vous les installer maintenant ?`n`nNote : L'installation peut prendre quelques minutes."
+    $message = "Modules PowerShell manquants : $moduleList`n`nCes modules sont nécessaires pour générer le rapport HTML.`n`nVoulez-vous les installer maintenant ?`n`nNote : L'installation peut prendre quelques minutes.`n(Sans HTML, décochez « Générer le rapport HTML » : aucun module n'est requis.)"
     $result = [System.Windows.Forms.MessageBox]::Show($message, "Installation des modules requis", [System.Windows.Forms.MessageBoxButtons]::YesNo, [System.Windows.Forms.MessageBoxIcon]::Question)
 
     if ($result -eq [System.Windows.Forms.DialogResult]::Yes) {
@@ -2158,26 +3559,47 @@ function Install-RequiredModules {
                 $lblStatus.Text = "📦 Installation de $module... (patientez)"; $form.Refresh()
                 Install-Module -Name $module -Force -AllowClobber -Scope CurrentUser -ErrorAction Stop
                 $lblStatus.Text = "✓ $module installé avec succès"; $lblStatus.ForeColor = [System.Drawing.Color]::Green; $form.Refresh()
-                Start-Sleep -Seconds 1
+                Write-Log "Module $module installé." -Level OK
             }
-            Show-InfoMessage "Modules installés avec succès !`n`nVous pouvez maintenant générer le dashboard."
-            $lblStatus.Text = "✓ Modules installés - Prêt à générer"; $lblStatus.ForeColor = [System.Drawing.Color]::Green
+            $lblStatus.Text = "✓ Modules installés"; $lblStatus.ForeColor = [System.Drawing.Color]::Green
             return $true
         } catch {
             $lblStatus.Text = "❌ Erreur lors de l'installation"; $lblStatus.ForeColor = [System.Drawing.Color]::Red
+            Write-Log "Installation de module impossible : $($_.Exception.Message)" -Level ERROR
             Show-ErrorMessage "Erreur lors de l'installation :`n`n$($_.Exception.Message)`n`nInstallez manuellement :`nInstall-Module -Name $moduleList -Force -AllowClobber -Scope CurrentUser"
             return $false
         }
     } else {
         $lblStatus.Text = "❌ Installation annulée"; $lblStatus.ForeColor = [System.Drawing.Color]::Red
-        Show-InfoMessage "Installation annulée.`n`nPour installer manuellement :`nInstall-Module -Name $($missingModules -join ',') -Force -AllowClobber -Scope CurrentUser"
+        Show-InfoMessage "Installation annulée.`n`nPour installer manuellement :`nInstall-Module -Name $moduleList -Force -AllowClobber -Scope CurrentUser"
         return $false
     }
+}
+
+# [v4.0] Texte des avertissements de la génération (message de fin et journal)
+function Get-RunWarningsText {
+    param([object]$NcResult, [System.Collections.Generic.List[string]]$RunWarnings, [System.Collections.Generic.List[string]]$HealthWarnings)
+    $text = ""
+    if ($NcResult -and -not $NcResult.Success) {
+        $text += "`n`n⚠ Analyse des non-conformités indisponible :`n$($NcResult.Error)"
+    } elseif ($NcResult -and $NcResult.Warnings.Count -gt 0) {
+        $text += "`n`n⚠ Analyse des non-conformités ($($NcResult.Warnings.Count) avertissement(s)) :`n- " + ($NcResult.Warnings -join "`n- ")
+    }
+    if ($HealthWarnings -and $HealthWarnings.Count -gt 0) {
+        $text += "`n`n⚠ Santé des postes ($($HealthWarnings.Count) source(s) partiellement disponible(s)) :`n- " + ($HealthWarnings -join "`n- ")
+    }
+    if ($RunWarnings -and $RunWarnings.Count -gt 0) {
+        $text += "`n`n⚠ Autres avertissements :`n- " + ($RunWarnings -join "`n- ")
+    }
+    return $text
 }
 
 # ========================================
 # GÉNÉRATION DU DASHBOARD
 # ========================================
+# [v4.0] Déroulé en phases : options -> prérequis -> authentification -> collectes et
+# analyses (une section décochée n'est pas collectée) -> anonymisation -> exports CSV
+# -> rendu HTML (facultatif) -> bilan. Détail de chaque étape dans $LogFile.
 
 function Generate-Dashboard {
     param([bool]$OpenAfterGeneration = $true)
@@ -2198,53 +3620,69 @@ function Generate-Dashboard {
     $ClientId     = $config.ClientId
     $ClientSecret = $config.ClientSecret
 
-    $lblStatus.Text = "⏳ Génération du dashboard pour $ClientName..."
+    # ===== [v4.0] OPTIONS DE SORTIE ET DE COLLECTE =====
+    # HTML décoché : requêtes Graph + exports CSV uniquement (PSWriteHTML non requis).
+    $GenerateHtml = $chkGenerateHtml.Checked
+    $ExportCsv    = $chkExportCsv.Checked -or -not $GenerateHtml
+    $HealthChecks = @{}
+    foreach ($def in $HealthCheckDefs) { $HealthChecks[$def.Key] = ($chkHealth.Checked -and $script:ChkHealthChecks[$def.Key].Checked) }
+    $ActiveHealthChecks = @($HealthChecks.Values | Where-Object { $_ }).Count
+    $RunHealth          = $ActiveHealthChecks -gt 0
+    $RunWarnings        = [System.Collections.Generic.List[string]]::new()
+    $HealthWarnings     = [System.Collections.Generic.List[string]]::new()
+    Reset-AnonymizationMaps
+
     $lblStatus.ForeColor = [System.Drawing.Color]::FromArgb(0, 120, 212)
-    $form.Refresh()
+    Write-Step "⏳ Génération pour $ClientName..."
+    Write-Log "================================================================"
+    Write-Log "NOUVELLE GÉNÉRATION - Client : $ClientName - HTML=$GenerateHtml / CSV=$ExportCsv / Santé=$ActiveHealthChecks vérification(s) / Parallèle=$($chkParallel.Checked)"
 
     try {
-        if (-not (Install-RequiredModules)) { return }
-
-        $lblStatus.Text = "📚 Chargement des modules PowerShell..."; $form.Refresh()
-        try {
-            Import-Module PSWriteHTML    -ErrorAction Stop
-            Import-Module Microsoft.Graph -ErrorAction Stop
-        } catch {
-            $lblStatus.Text = "❌ Erreur de chargement des modules"; $lblStatus.ForeColor = [System.Drawing.Color]::Red
-            Show-ErrorMessage "Erreur lors du chargement des modules :`n`n$($_.Exception.Message)"; return
+        if ($GenerateHtml) {
+            if (-not (Install-RequiredModules -Modules @("PSWriteHTML"))) { return }
+            Write-Step "📚 Chargement du module PSWriteHTML..."
+            try {
+                Import-Module PSWriteHTML -ErrorAction Stop
+            } catch {
+                $lblStatus.Text = "❌ Erreur de chargement des modules"; $lblStatus.ForeColor = [System.Drawing.Color]::Red
+                Show-ErrorMessage "Erreur lors du chargement du module PSWriteHTML :`n`n$($_.Exception.Message)"; return
+            }
         }
 
         # ===== CONNEXION GRAPH =====
-        $lblStatus.Text = "🔐 Connexion à Microsoft Graph..."; $form.Refresh()
+        Write-Step "🔐 Connexion à Microsoft Graph..."
         # [v3.3] Jeton géré par Get-GraphAccessToken : erreur d'authentification explicite
         # (secret expiré, tenant inconnu, réseau) et renouvellement automatique avant
         # expiration pendant les analyses longues. Cache par appareil remis à zéro.
-        $script:GraphAuth       = @{ TenantId = $TenantId; ClientId = $ClientId; ClientSecret = $ClientSecret; AccessToken = $null; ExpiresAtUtc = [datetime]::MinValue }
+        # [v4.0] Contexte synchronisé partagé avec les flux de collecte parallèle.
+        $script:GraphContext    = New-GraphContext -TenantId $TenantId -ClientId $ClientId -ClientSecret $ClientSecret
         $script:NcSettingsCache = @{}
         try {
             $AccessToken = Get-GraphAccessToken -ForceRefresh
         } catch {
             $lblStatus.Text = "❌ Échec de l'authentification Microsoft Graph"; $lblStatus.ForeColor = [System.Drawing.Color]::Red
+            Write-Log "Authentification impossible : $($_.Exception.Message)" -Level ERROR
             Show-ErrorMessage "Impossible d'obtenir un jeton d'accès Microsoft Graph pour $ClientName :`n`n$($_.Exception.Message)"
             return
         }
-        $SecureToken = ConvertTo-SecureString -String $AccessToken -AsPlainText -Force
-        Connect-MgGraph -AccessToken $SecureToken -NoWelcome
+        Write-Log "Jeton d'accès Graph obtenu." -Level OK
 
         # ===== RÉCUPÉRATION DES APPAREILS =====
-        $lblStatus.Text = "💻 Récupération des appareils gérés..."; $form.Refresh()
-        $ManagedDevices = Get-MgDeviceManagementManagedDevice -All
+        Write-Step "💻 Récupération des appareils gérés..."
+        # [v4.0] REST + $select (remplace Get-MgDeviceManagementManagedDevice -All)
+        $ManagedDevices = @(Get-ManagedDevicesRest -AccessToken $AccessToken)
         $ExcludeVM      = $chkExcludeVM.Checked
         $AnonymizeData  = $chkAnonymize.Checked
 
         $DevicesScope = if ($ExcludeVM) {
-            $ManagedDevices | Where-Object {
+            @($ManagedDevices | Where-Object {
                 -not (
                     ($_.Manufacturer -match 'VMware|innotek|VirtualBox|Parallels|QEMU') -or
                     ($_.Model        -match 'Virtual|VMware|VirtualBox|Hyper-V|Parallels|QEMU|KVM')
                 )
-            }
+            })
         } else { $ManagedDevices }
+        Write-Log "Périmètre d'analyse : $($DevicesScope.Count) appareil(s) sur $($ManagedDevices.Count) (exclusion des VM : $ExcludeVM)."
 
         # ===== LECTURE DES OPTIONS D'AFFICHAGE =====
         # Plateformes à afficher
@@ -2262,16 +3700,19 @@ function Generate-Dashboard {
         if ($chkInactive150.Checked) { [void]$InactiveThresholds.Add(150) }
         if ($chkInactive180.Checked) { [void]$InactiveThresholds.Add(180) }
 
-        $ShowLowStorage = $chkLowStorage.Checked
-
         # ===== APPLICATIONS =====
         if ($chkApplications.Checked) {
-            $lblStatus.Text = "📱 Récupération des applications..."; $form.Refresh()
-            $ManagedApps = Get-MgDeviceAppManagementMobileApp -All
+            Write-Step "📱 Récupération des applications..."
+            try {
+                $ManagedApps = @(Get-MobileAppsRest -AccessToken $AccessToken)
+            } catch {
+                $ManagedApps = @()
+                $RunWarnings.Add("Applications du tenant : $($_.Exception.Message)")
+            }
         }
 
         # ===== CLASSIFICATION PAR PLATEFORME =====
-        $lblStatus.Text = "🔍 Analyse des types d'appareils..."; $form.Refresh()
+        Write-Step "🔍 Analyse des types d'appareils..."
         $WindowsDevices = @($DevicesScope | Where-Object { $_.OperatingSystem -like "Windows*" })
         $iOSDevices     = @($DevicesScope | Where-Object { $_.OperatingSystem -like "iOS*" })
         $AndroidDevices = @($DevicesScope | Where-Object { $_.OperatingSystem -like "Android*" })
@@ -2279,7 +3720,7 @@ function Generate-Dashboard {
 
         # ===== CONFORMITÉ =====
         if ($chkCompliance.Checked) {
-            $lblStatus.Text = "✓ Analyse de la conformité..."; $form.Refresh()
+            Write-Step "✓ Analyse de la conformité..."
             $CompliantDevices    = @($DevicesScope | Where-Object ComplianceState -EQ "compliant")
             $NoncompliantDevices = @($DevicesScope | Where-Object ComplianceState -EQ "noncompliant")
         }
@@ -2290,47 +3731,42 @@ function Generate-Dashboard {
         # L'analyse gère ses propres erreurs : un échec n'interrompt pas le dashboard.
         $NcResult = $null
         if ($chkNcAnalysis.Checked) {
-            $lblStatus.Text = "🧩 Analyse des raisons de non-conformité (API Graph)..."; $form.Refresh()
+            Write-Step "🧩 Analyse des raisons de non-conformité (API Graph)..."
             $NcResult = Invoke-NonComplianceAnalysis -ScopeDevices $DevicesScope -AccessToken $AccessToken -Anonymize:$AnonymizeData
         }
 
         # ===== APPAREILS INACTIFS (paliers dynamiques) =====
         $InactiveDevicesByThreshold = @{}
         if ($InactiveThresholds.Count -gt 0) {
-            $lblStatus.Text = "⏰ Détection des appareils inactifs..."; $form.Refresh()
+            Write-Step "⏰ Détection des appareils inactifs..."
             foreach ($days in $InactiveThresholds) {
-                $cutoff = (Get-Date).AddDays(-$days)
+                # [v4.0] Seuil en UTC, comme les dates de synchronisation
+                $cutoff = [datetime]::UtcNow.AddDays(-$days)
                 $InactiveDevicesByThreshold["$days"] = @($DevicesScope | Where-Object { $_.LastSyncDateTime -lt $cutoff })
             }
         }
 
-        # ===== LOW STORAGE =====
-        if ($ShowLowStorage) {
-            $MinimumFreeSpace  = 100
-            $LowStorageDevices = @($DevicesScope | Where-Object { ($_.FreeStorageSpaceInBytes / 1GB) -lt $MinimumFreeSpace })
-        }
-
         # ===== CHIFFREMENT =====
         if ($chkEncryption.Checked) {
-            $lblStatus.Text = "🔒 Vérification du chiffrement..."; $form.Refresh()
+            Write-Step "🔒 Vérification du chiffrement..."
             $EncryptedDevices  = @($DevicesScope | Where-Object IsEncrypted -EQ $true)
             $UnecryptedDevices = @($DevicesScope | Where-Object IsEncrypted -EQ $false)
 
             # ===== [MODIF v3] ENRICHISSEMENT "NON ENCRYPTED" : ROOT CAUSE + INACTIVITÉ =====
             # Pour chaque poste non chiffré :
-            #  - calcul du nombre de jours d'inactivité (lastSyncDateTime, déjà présent
-            #    dans les objets renvoyés par Get-MgDeviceManagementManagedDevice)
+            #  - calcul du nombre de jours d'inactivité (lastSyncDateTime de l'appareil)
             #  - récupération des raisons exactes de non-conformité via l'API Graph
             #    (deviceCompliancePolicyStates + settingStates)
-            $NonEncryptedEnriched = @()
+            # [v4.0] États préchargés par lots de 20 ($batch) au lieu d'un appel par poste
+            Initialize-NcSettingsCache -DeviceIds @($UnecryptedDevices | ForEach-Object { "$($_.Id)" }) -AccessToken $AccessToken
+            $NonEncryptedList = [System.Collections.Generic.List[object]]::new()
             $idx    = 0
-            $nowUtc = (Get-Date).ToUniversalTime()   # lastSyncDateTime est en UTC
+            $nowUtc = [datetime]::UtcNow   # lastSyncDateTime est en UTC
 
             foreach ($dev in $UnecryptedDevices) {
                 $idx++
                 if ($idx -eq 1 -or $idx % 5 -eq 0 -or $idx -eq $UnecryptedDevices.Count) {
-                    $lblStatus.Text = "🔎 Analyse des causes racines (Non Encrypted) : $idx / $($UnecryptedDevices.Count)..."
-                    $form.Refresh()
+                    Set-UiStatus "🔎 Analyse des causes racines (Non Encrypted) : $idx / $($UnecryptedDevices.Count)..."
                 }
 
                 # --- Jours d'inactivité (null = jamais synchronisé => traité comme inactif) ---
@@ -2338,8 +3774,8 @@ function Generate-Dashboard {
                     [int][math]::Floor(($nowUtc - $dev.LastSyncDateTime).TotalDays)
                 } else { $null }
 
-                # --- Raisons précises de non-conformité (appels Graph) ---
-                $reasons = Get-DeviceNonComplianceReasons -DeviceId $dev.Id -AccessToken $AccessToken
+                # --- Raisons précises de non-conformité (cache, sinon appel Graph) ---
+                $reasons = @(Get-DeviceNonComplianceReasons -DeviceId $dev.Id -AccessToken $AccessToken)
 
                 # --- Construction du libellé RootCause affiché dans le dashboard ---
                 if ($reasons.Count -gt 0) {
@@ -2355,7 +3791,7 @@ function Generate-Dashboard {
                     $rootCause += " (poste inactif - données possiblement obsolètes)"
                 }
 
-                $NonEncryptedEnriched += [PSCustomObject]@{
+                $NonEncryptedList.Add([PSCustomObject]@{
                     DeviceName        = $dev.DeviceName
                     UserPrincipalName = $dev.UserPrincipalName
                     OperatingSystem   = $dev.OperatingSystem
@@ -2367,11 +3803,11 @@ function Generate-Dashboard {
                     DaysInactive      = $daysInactive
                     LastSyncDateTime  = $dev.LastSyncDateTime
                     EnrolledDateTime  = $dev.EnrolledDateTime
-                }
+                })
             }
 
             # Tri : postes actifs en premier (les null = jamais vus, à la fin)
-            $NonEncryptedEnriched = @($NonEncryptedEnriched | Sort-Object @{ Expression = { if ($null -eq $_.DaysInactive) { 999999 } else { $_.DaysInactive } } })
+            $NonEncryptedEnriched = @($NonEncryptedList | Sort-Object @{ Expression = { if ($null -eq $_.DaysInactive) { 999999 } else { $_.DaysInactive } } })
         }
 
         # ===== INVENTAIRE =====
@@ -2379,9 +3815,100 @@ function Generate-Dashboard {
             Select-Object DeviceName, UserPrincipalName, OperatingSystem, Manufacturer, Model, OSVersion, ComplianceState, IsEncrypted, LastSyncDateTime, EnrolledDateTime |
             Sort-Object -Descending ComplianceState
 
+        # ===== HARDWARE =====
+        if ($chkHardware.Checked -and $WindowsDevices.Count -gt 0) {
+            $OSVersions = $WindowsDevices | Group-Object OSVersion | Sort-Object Count -Descending | Select-Object Name, Count -First 10
+            $Model      = $WindowsDevices | Group-Object { "$($_.Manufacturer), $($_.Model)" } | Sort-Object Count -Descending | Select-Object Name, Count -First 10
+        }
+
+        # ===== ÉCHECS APPS =====
+        if ($chkApplications.Checked) {
+            Write-Step "📱 Analyse des échecs d'installation..."
+            $FailedAppsAll = @()
+            try {
+                $FailedAppsAll = @(Get-FailedAppsReportRest -AccessToken $AccessToken)
+            } catch {
+                # [v4.0] Erreur remontée (la v3 la masquait par un "catch {}" vide)
+                $RunWarnings.Add("Rapport des échecs d'installation : $($_.Exception.Message)")
+            }
+
+            $FailedAppsTop10       = $FailedAppsAll | Sort-Object -Property FailedDeviceCount -Descending | Select-Object -First 10
+            $LatestFailedAppsTop10 = [System.Collections.Generic.List[object]]::new()
+            $FailedByName          = @{}
+            foreach ($f in $FailedAppsAll) { if ($f.DisplayName -and -not $FailedByName.ContainsKey("$($f.DisplayName)")) { $FailedByName["$($f.DisplayName)"] = $f } }
+            $ManagedAppsSorted     = $ManagedApps | Sort-Object -Property CreatedDateTime -Descending
+            foreach ($app in $ManagedAppsSorted) {
+                $failed = $FailedByName["$($app.DisplayName)"]
+                if ($failed) {
+                    $LatestFailedAppsTop10.Add([PSCustomObject]@{
+                        DisplayName       = $failed.DisplayName
+                        FailedDeviceCount = $failed.FailedDeviceCount
+                        CreatedDateTime   = $app.CreatedDateTime
+                    })
+                }
+                if ($LatestFailedAppsTop10.Count -ge 10) { break }
+            }
+            $AppsForFailedDonut = @(if ($LatestFailedAppsTop10.Count -gt 0) { $LatestFailedAppsTop10 } else { $FailedAppsTop10 })
+        }
+
+        # ===== [v4.0] PROFILS DE CONFIGURATION (Update Rings + vérification "profils") =====
+        $DeviceConfigurations = @()
+        if ($chkUpdateRings.Checked -or $HealthChecks.ConfigProfile) {
+            Write-Step "⚙ Lecture des profils de configuration..."
+            try {
+                $DeviceConfigurations = @(Get-DeviceConfigurationsRest -AccessToken $AccessToken)
+            } catch {
+                $RunWarnings.Add("Profils de configuration : $($_.Exception.Message)")
+            }
+        }
+
+        # ===== UPDATE RINGS =====
+        if ($chkUpdateRings.Checked) {
+            Write-Step "🔄 Analyse des Windows Update Rings..."
+            $RingData           = Get-UpdateRingData -Configurations $DeviceConfigurations -AccessToken $AccessToken -Warnings $RunWarnings
+            $UpdateRingsSummary = $RingData.Summary
+            $UpdateRingsDevices = $RingData.Devices
+            if ($AnonymizeData -and $UpdateRingsDevices.Count -gt 0) {
+                $UpdateRingsDevices = @($UpdateRingsDevices | ForEach-Object {
+                    $anon = Get-AnonymizedIdentity -RealName $_.DeviceName -RealUpn $_.UserName
+                    [PSCustomObject]@{
+                        RingName     = $_.RingName
+                        DeviceName   = $anon.Name
+                        UserName     = $anon.Upn
+                        Status       = $_.Status
+                        LastReported = $_.LastReported
+                    }
+                })
+            }
+        }
+
+        # ===== [FUSION v4 - Proactivité] SANTÉ & PROACTIVITÉ DES POSTES =====
+        # Réutilise les appareils déjà collectés (disque, inactivité, conformité : aucun
+        # appel en plus) ; seules les vérifications cochées déclenchent des appels.
+        $HealthData = $null
+        if ($RunHealth) {
+            $HealthRaw = Invoke-HealthCollection -Devices $DevicesScope -Checks $HealthChecks -DeviceConfigurations $DeviceConfigurations `
+                             -AccessToken $AccessToken -Parallel $chkParallel.Checked -Warnings $HealthWarnings
+            # Motifs de non-conformité ramenés au niveau du poste (clé : id Intune réel)
+            $ComplianceReasonsById = @{}
+            if ($NcResult -and $NcResult.Success) {
+                foreach ($r in $NcResult.Rows) {
+                    $key = [string]$r.DeviceKey
+                    if (-not $ComplianceReasonsById.ContainsKey($key)) { $ComplianceReasonsById[$key] = [string]$r.Reason }
+                    elseif ($ComplianceReasonsById[$key] -notlike "*$($r.Reason)*") { $ComplianceReasonsById[$key] += " ; $($r.Reason)" }
+                }
+            }
+            Write-Step "🩺 Analyse de la santé des postes..."
+            $HealthData = Build-RemediationData -Devices $DevicesScope -Health $HealthRaw -Checks $HealthChecks `
+                              -ComplianceReasonsById $ComplianceReasonsById -AnonymizeData $AnonymizeData
+            $level = if ($HealthData.CritCount -gt 0) { "WARN" } else { "OK" }
+            Write-Log "Santé des postes : $(@($HealthData.Rows).Count) poste(s) - critiques $($HealthData.CritCount) / à surveiller $($HealthData.WarnCount) / OK $($HealthData.OkCount)" -Level $level
+        }
+
         # ===== ANONYMISATION =====
+        # [v4.0] Alias stables (Get-AnonymizedIdentity) : identiques dans toutes les pages et tous les CSV
         if ($AnonymizeData) {
-            $lblStatus.Text = "🔐 Anonymisation des données sensibles..."; $form.Refresh()
+            Write-Step "🔐 Anonymisation des données sensibles..."
             $ManagedDevicesTable = Anonymize-DeviceData -DeviceList $ManagedDevicesTable
             if ($chkCompliance.Checked) {
                 $CompliantDevices    = Anonymize-DeviceData -DeviceList $CompliantDevices
@@ -2399,7 +3926,6 @@ function Generate-Dashboard {
             if ($chkEncryption.Checked -and $NonEncryptedEnriched.Count -gt 0) {
                 $NonEncryptedEnriched = Anonymize-DeviceData -DeviceList $NonEncryptedEnriched
             }
-            if ($ShowLowStorage)          { $LowStorageDevices  = Anonymize-DeviceData -DeviceList $LowStorageDevices }
         }
 
         # ===== APPLICATIONS - TABLE =====
@@ -2409,130 +3935,71 @@ function Generate-Dashboard {
                 Sort-Object -Descending CreatedDateTime
         }
 
-        # ===== HARDWARE =====
-        if ($chkHardware.Checked -and $WindowsDevices.Count -gt 0) {
-            $OSVersions = $WindowsDevices | Group-Object OSVersion | Sort-Object Count -Descending | Select-Object Name, Count -First 10
-            $Model      = $WindowsDevices | Group-Object { "$($_.Manufacturer), $($_.Model)" } | Sort-Object Count -Descending | Select-Object Name, Count -First 10
-        }
+        $Timestamp        = (Get-Date).ToString("yyyy-MM-dd_HHmmss")
+        $AnonymizedSuffix = if ($AnonymizeData) { "_ANONYMIZED" } else { "" }
+        $SafeFileClient   = $ClientName -replace '[\\/:*?"<>|]', '_'
+        $ReportFileName   = "Intune-Dashboard_${SafeFileClient}${AnonymizedSuffix}_${Timestamp}.html"
 
-        # ===== [v3.3] JETON APRÈS LES ANALYSES LONGUES =====
-        # Les analyses par appareil (non-conformités, Non Encrypted) peuvent dépasser la
-        # durée de vie du jeton (~1 h) : il est renouvelé si besoin pour les appels suivants
-        # (rapport d'échecs d'applications, SDK Graph des Update Rings).
-        try {
-            $FreshToken = Get-GraphAccessToken
-            if ($FreshToken -and $FreshToken -ne $AccessToken) {
-                $AccessToken = $FreshToken
-                Connect-MgGraph -AccessToken (ConvertTo-SecureString -String $AccessToken -AsPlainText -Force) -NoWelcome
+        # ===== [v4.0] EXPORTS CSV DE TOUTES LES SECTIONS =====
+        # Un dossier horodaté par génération ; une section décochée n'a pas de fichier.
+        $ExportFolder = ""
+        $ExportFiles  = @()
+        $NcCsvFiles   = @()
+        if ($ExportCsv) {
+            Write-Step "📄 Export CSV des données collectées..."
+            $ExportFolder = Join-Path $OutputFolder "Intune-Export_${SafeFileClient}${AnonymizedSuffix}_${Timestamp}"
+            $Datasets = [ordered]@{ "01_Appareils" = @($ManagedDevicesTable) }
+            if ($chkCompliance.Checked) {
+                $Datasets["02_Conformite_Non_Conformes"] = @($NoncompliantDevices | Select-Object DeviceName, UserPrincipalName, OperatingSystem, Manufacturer, Model, OSVersion, ComplianceState, IsEncrypted, LastSyncDateTime, EnrolledDateTime)
             }
-        } catch {
-            Write-Host "[Graph] Renouvellement du jeton impossible, poursuite avec le jeton courant : $($_.Exception.Message)" -ForegroundColor DarkYellow
-        }
-
-        # ===== ÉCHECS APPS =====
-        if ($chkApplications.Checked) {
-            $lblStatus.Text = "📱 Analyse des échecs d'installation..."; $form.Refresh()
-            $FailedAppsAll = @()
-            try {
-                $FailedAppsUri = "https://graph.microsoft.com/beta/deviceManagement/reports/getFailedMobileAppsReport"
-                $FailedBody    = @{ top = 5000; orderBy = @("FailedDeviceCount desc") } | ConvertTo-Json
-                $FailedResp    = Invoke-RestMethod -Method POST -Uri $FailedAppsUri -Headers @{ Authorization = "Bearer $AccessToken" } -Body $FailedBody -ContentType "application/json" -ErrorAction Stop
-                if ($FailedResp.Values) {
-                    $schema = $FailedResp.Schema
-                    foreach ($row in $FailedResp.Values) {
-                        $obj = [ordered]@{}
-                        for ($i = 0; $i -lt $schema.Count; $i++) { $obj[$schema[$i].Column] = $row[$i] }
-                        $FailedAppsAll += [PSCustomObject]$obj
-                    }
-                }
-            } catch {}
-
-            $FailedAppsTop10       = $FailedAppsAll | Sort-Object -Property FailedDeviceCount -Descending | Select-Object -First 10
-            $LatestFailedAppsTop10 = @()
-            $ManagedAppsSorted     = $ManagedApps | Sort-Object -Property CreatedDateTime -Descending
-            foreach ($app in $ManagedAppsSorted) {
-                $failed = $FailedAppsAll | Where-Object { $_.DisplayName -eq $app.DisplayName } | Select-Object -First 1
-                if ($failed) {
-                    $LatestFailedAppsTop10 += [PSCustomObject]@{
-                        DisplayName       = $failed.DisplayName
-                        FailedDeviceCount = $failed.FailedDeviceCount
-                        CreatedDateTime   = $app.CreatedDateTime
-                    }
-                }
-                if ($LatestFailedAppsTop10.Count -ge 10) { break }
+            if ($NcResult -and $NcResult.Success -and $NcResult.Kpi.PostesTotal -gt 0) {
+                foreach ($entry in (Get-NcCsvDatasets -Result $NcResult -ClientName $ClientName -Prefix "03_NonConformites_").GetEnumerator()) { $Datasets[$entry.Key] = $entry.Value }
             }
-            $AppsForFailedDonut = if ($LatestFailedAppsTop10.Count -gt 0) { $LatestFailedAppsTop10 } else { $FailedAppsTop10 }
+            if ($chkEncryption.Checked) {
+                $Datasets["04_Chiffrement_Non_Chiffres"] = @($NonEncryptedEnriched | Select-Object DeviceName, UserPrincipalName, OperatingSystem, Manufacturer, Model, OSVersion, ComplianceState, RootCause, DaysInactive, LastSyncDateTime, EnrolledDateTime)
+            }
+            if ($chkApplications.Checked) {
+                $Datasets["05_Applications"]        = @($ManagedAppTable)
+                $Datasets["06_Applications_Echecs"] = @($FailedAppsAll)
+            }
+            if ($chkUpdateRings.Checked) {
+                $Datasets["07_UpdateRings_Synthese"] = @($UpdateRingsSummary)
+                $Datasets["08_UpdateRings_Postes"]   = @($UpdateRingsDevices)
+            }
+            if ($chkHardware.Checked) {
+                $Datasets["09_Materiel_Modeles"]     = @($Model)
+                $Datasets["10_Materiel_Versions_OS"] = @($OSVersions)
+            }
+            if ($HealthData) {
+                $Datasets["11_Sante_Postes"]           = @(Select-HealthDeviceView -Rows $HealthData.Rows)
+                $Datasets["12_Sante_Actions_Synthese"] = @(Get-HealthActionSummary -Actions $HealthData.Actions)
+                $Datasets["13_Sante_Actions_Postes"]   = @(Select-HealthActionDetailView -Actions $HealthData.Actions)
+                $Datasets["14_Sante_Espace_Disque"]    = @(Select-HealthDiskView -Rows $HealthData.Rows)
+            }
+            foreach ($days in $InactiveThresholds) {
+                $Datasets[("15_Inactifs_{0:000}j" -f $days)] = @($InactiveDevicesByThreshold["$days"] | Select-Object DeviceName, UserPrincipalName, OperatingSystem, Manufacturer, Model, OSVersion, ComplianceState, IsEncrypted, LastSyncDateTime, EnrolledDateTime)
+            }
+            $ExportFiles = @(Export-AllDatasets -Datasets $Datasets -Folder $ExportFolder -Warnings $RunWarnings)
+            $NcCsvFiles  = @($ExportFiles | Where-Object { [IO.Path]::GetFileName($_) -like "03_NonConformites_*" })
         }
 
-        # ===== UPDATE RINGS =====
-        if ($chkUpdateRings.Checked) {
-            $lblStatus.Text = "🔄 Analyse des Windows Update Rings..."; $form.Refresh()
-            $UpdateRingsSummary = @(); $UpdateRingsDevices = @()
-            try {
-                $allConfigs         = Get-MgDeviceManagementDeviceConfiguration -All
-                $UpdateRingPolicies = $allConfigs | Where-Object {
-                    $_.ODataType -like "*windowsUpdateForBusinessConfiguration*" -or
-                    $_.AdditionalProperties.'@odata.type' -like "*windowsUpdateForBusinessConfiguration*"
-                }
-                foreach ($pol in $UpdateRingPolicies) {
-                    $statusUri      = "https://graph.microsoft.com/beta/deviceManagement/deviceConfigurations/$($pol.Id)/deviceStatuses?`$top=1000"
-                    $devStatuses    = Get-GraphPagedResults -Url $statusUri -AccessToken $AccessToken
-                    if (-not $devStatuses -or $devStatuses.Count -eq 0) { continue }
-                    $devUserStatuses = $devStatuses | Where-Object {
-                        $_.UserName -and $_.UserName.Trim() -ne "" -and $_.UserName -ne "System account" -and $_.UserName -match "@"
-                    }
-                    if ($devUserStatuses.Count -eq 0) { continue }
-                    $UpdateRingsSummary += [PSCustomObject]@{
-                        RingName      = $pol.DisplayName
-                        DeviceCount   = $devUserStatuses.Count
-                        Succeeded     = ($devUserStatuses | Where-Object Status -eq "compliant").Count
-                        Error         = ($devUserStatuses | Where-Object Status -eq "error").Count
-                        Conflict      = ($devUserStatuses | Where-Object Status -eq "conflict").Count
-                        NotApplicable = ($devUserStatuses | Where-Object Status -eq "notApplicable").Count
-                        InProgress    = ($devUserStatuses | Where-Object Status -eq "inProgress").Count
-                    }
-                    foreach ($ds in $devUserStatuses) {
-                        $UpdateRingsDevices += [PSCustomObject]@{
-                            RingName     = $pol.DisplayName
-                            DeviceName   = $ds.DeviceDisplayName
-                            UserName     = $ds.UserName
-                            Status       = $ds.Status
-                            LastReported = $ds.LastReportedDateTime
-                        }
-                    }
-                }
-                if ($AnonymizeData -and $UpdateRingsDevices.Count -gt 0) {
-                    $UpdateRingsDevices = $UpdateRingsDevices | ForEach-Object {
-                        [PSCustomObject]@{
-                            RingName     = $_.RingName
-                            DeviceName   = "Poste-" + ([guid]::NewGuid().ToString().Substring(0, 8))
-                            UserName     = "User-"  + ([guid]::NewGuid().ToString().Substring(0, 8))
-                            Status       = $_.Status
-                            LastReported = $_.LastReported
-                        }
-                    }
-                }
-                $UpdateRingsSummary = $UpdateRingsSummary | Sort-Object RingName
-                $UpdateRingsDevices = $UpdateRingsDevices | Sort-Object RingName, DeviceName
-            } catch {}
+        # ===== [v4.0] SANS RAPPORT HTML : BILAN ET FIN =====
+        if (-not $GenerateHtml) {
+            $lblStatus.Text = "✓ Collecte et exports CSV terminés"; $lblStatus.ForeColor = [System.Drawing.Color]::Green
+            $message = "Collecte terminée (rapport HTML désactivé)."
+            if ($ExportFiles.Count -gt 0) { $message += "`n`n$($ExportFiles.Count) fichier(s) CSV :`n$ExportFolder" }
+            else                          { $message += "`n`nAucun fichier CSV n'a pu être écrit (voir les avertissements)." }
+            if ($OpenAfterGeneration -and $ExportFiles.Count -gt 0) { $message += "`n`nLe dossier des exports s'ouvre automatiquement." }
+            $warnText = Get-RunWarningsText -NcResult $NcResult -RunWarnings $RunWarnings -HealthWarnings $HealthWarnings
+            if ($warnText) { Write-Log ($warnText.Trim()) -Level WARN }
+            Write-Log "SUCCÈS (sans HTML) - $($ExportFiles.Count) fichier(s) CSV dans $ExportFolder" -Level OK
+            Show-InfoMessage ($message + $warnText)
+            if ($OpenAfterGeneration -and $ExportFiles.Count -gt 0) { Invoke-Item -LiteralPath $ExportFolder }
+            return
         }
 
         # ===== GÉNÉRATION HTML =====
-        $lblStatus.Text = "📄 Génération du fichier HTML..."; $form.Refresh()
-        $Timestamp        = (Get-Date).ToString("yyyy-MM-dd_HHmmss")
-        $AnonymizedSuffix = if ($AnonymizeData) { "_ANONYMIZED" } else { "" }
-        $ReportFileName   = "Intune-Dashboard_${ClientName}${AnonymizedSuffix}_${Timestamp}.html"
-
-        # ===== [v3.3] EXPORT CSV DES SYNTHÈSES DE NON-CONFORMITÉ =====
-        # Un sous-dossier par génération, à côté du rapport HTML
-        $NcCsvFiles  = @()
-        $NcCsvFolder = ""
-        if ($chkNcAnalysis.Checked -and $chkNcCsv.Checked -and $NcResult -and $NcResult.Success -and $NcResult.Kpi.PostesTotal -gt 0) {
-            $lblStatus.Text = "📄 Export CSV des synthèses de non-conformité..."; $form.Refresh()
-            $SafeFileClient = $ClientName -replace '[\\/:*?"<>|]', '_'
-            $NcCsvFolder    = Join-Path $OutputFolder "Intune-NonCompliance_${SafeFileClient}${AnonymizedSuffix}_${Timestamp}"
-            $NcCsvFiles     = @(Export-NcCsvReports -Result $NcResult -Folder $NcCsvFolder -ClientName $ClientName)
-        }
+        Write-Step "📄 Génération du fichier HTML..."
 
         # ===== [MODIF v3] COMPTEURS "NON ENCRYPTED" POUR LE FILTRE DU DASHBOARD =====
         # Calculés côté PowerShell puis injectés dans le JavaScript du dashboard :
@@ -2612,16 +4079,31 @@ $ContactHtml
         if ($ShowMac)     { [void]$ov.Append((New-IxStatCard -Label 'macOS'   -Value $MacDevices.Count     -Icon 'laptop'     -Color $Colors.PlatformMac     -Caption "<b>$(Get-IxPercent $MacDevices.Count $TotalDevices) %</b> du parc")) }
         $OverviewHtml = "<div class=`"ix-root ix-overview`">$($ov.ToString())</div>"
 
-        # --- [v3.2] Cartes inactivité + stockage (déplacées vers la page Optimisation du parc) ---
+        # --- [v3.2] Cartes inactivité + stockage (page Santé & proactivité depuis la v4.0) ---
         $op = [System.Text.StringBuilder]::new()
         foreach ($days in $InactiveThresholds) {
             $count = $InactiveDevicesByThreshold["$days"].Count
             [void]$op.Append((New-IxStatCard -Label "Inactifs $days+ jours" -Value $count -Icon 'clock' -Color $InactiveColorMap["$days"] -Caption "<b>$(Get-IxPercent $count $TotalDevices) %</b> sans synchronisation"))
         }
-        if ($ShowLowStorage) {
-            [void]$op.Append((New-IxStatCard -Label 'Low storage' -Value $LowStorageDevices.Count -Icon 'hard-drive' -Color $Colors.Warning -Caption 'Espace libre &lt; 100 GB'))
+        # [v4.0] Espace disque jugé en % (seuils du script Proactivité) au lieu de
+        # "moins de 100 Go libres", qui signalait presque tous les portables 256 Go
+        $DiskCritCount = 0; $DiskWarnCount = 0
+        if ($HealthData -and $HealthChecks.Disk) {
+            $DiskCritCount = @($HealthData.Rows | Where-Object { $_.DiskSeverity -eq 'crit' }).Count
+            $DiskWarnCount = @($HealthData.Rows | Where-Object { $_.DiskSeverity -eq 'warn' }).Count
+            $T = $RemediationThresholds
+            [void]$op.Append((New-IxStatCard -Label 'Disque critique' -Value $DiskCritCount -Icon 'hard-drive' -Color $Colors.Danger -Caption "Moins de $($T.DiskFreePctCritical) % ou $($T.DiskFreeGbCritical) Go libres"))
+            [void]$op.Append((New-IxStatCard -Label 'Disque à surveiller' -Value $DiskWarnCount -Icon 'hard-drive' -Color $Colors.Warning -Caption "Moins de $($T.DiskFreePctWarning) % d'espace libre"))
         }
         $OptimHtml = if ($op.Length -gt 0) { "<div class=`"ix-root ix-overview`">$($op.ToString())</div>" } else { "" }
+
+        # --- [FUSION v4 - Proactivité] Page Santé : KPI, lecture, avertissements, synthèses ---
+        $HealthHeadHtml = ""
+        $HealthActions  = @()
+        if ($HealthData) {
+            $HealthHeadHtml = New-HealthDashboardHeadHtml -Data $HealthData -Warnings $HealthWarnings -ActiveChecks $ActiveHealthChecks
+            $HealthActions  = @(Get-HealthActionSummary -Actions $HealthData.Actions)
+        }
 
         # --- Update Rings : cartes avec taux de succès, barre de répartition et métriques ---
         $RingsHtml = ""
@@ -2690,7 +4172,7 @@ $ContactHtml
         # --- [v3.3] Analyse des non-conformités : KPI, règle de lecture, source, avertissements ---
         $NcHeadHtml = ""
         if ($chkNcAnalysis.Checked -and $NcResult) {
-            $NcHeadHtml = New-NcDashboardHeadHtml -Result $NcResult -TotalDevices $TotalDevices -CsvFolder $NcCsvFolder -CsvFiles $NcCsvFiles
+            $NcHeadHtml = New-NcDashboardHeadHtml -Result $NcResult -TotalDevices $TotalDevices -CsvFolder $ExportFolder -CsvFiles $NcCsvFiles
         }
         $NcHasData = $chkNcAnalysis.Checked -and $NcResult -and $NcResult.Success -and $NcResult.Kpi.PostesTotal -gt 0
 
@@ -2701,13 +4183,14 @@ $ContactHtml
         # ============================================================
         $HasSecurity = $chkCompliance.Checked -or $chkEncryption.Checked -or $chkNcAnalysis.Checked
         $HasDeploy   = $chkUpdateRings.Checked -or $chkApplications.Checked
-        $HasOptim    = ($InactiveThresholds.Count -gt 0) -or $ShowLowStorage
+        # [v4.0] "Santé & proactivité" absorbe "Optimisation du parc" (inactifs + disque)
+        $HasSante    = ($InactiveThresholds.Count -gt 0) -or [bool]$HealthData
 
         $IxPages = [System.Collections.Generic.List[object]]::new()
         $IxPages.Add([PSCustomObject]@{ Id = 'vue-ensemble'; Icon = 'layout'; Label = "Vue d'ensemble"; Hint = 'Taille et composition du parc : plateformes, modèles et versions de Windows' })
         if ($HasSecurity) { $IxPages.Add([PSCustomObject]@{ Id = 'securite';     Icon = 'shield';  Label = 'Sécurité & conformité';       Hint = 'Conformité Intune, raisons de non-conformité et chiffrement BitLocker' }) }
         if ($HasDeploy)   { $IxPages.Add([PSCustomObject]@{ Id = 'deploiement';  Icon = 'package'; Label = 'Mises à jour & applications'; Hint = 'Windows Update Rings et déploiement des applications' }) }
-        if ($HasOptim)    { $IxPages.Add([PSCustomObject]@{ Id = 'optimisation'; Icon = 'gauge';   Label = 'Optimisation du parc';        Hint = 'Appareils inactifs et espace disque disponible' }) }
+        if ($HasSante)    { $IxPages.Add([PSCustomObject]@{ Id = 'sante';        Icon = 'gauge';   Label = 'Santé & proactivité';         Hint = 'Endpoint Analytics, disque, démarrage, écrans bleus, batteries, inactivité et actions de remédiation' }) }
 
         $IxPage = @{}
         foreach ($p in $IxPages) { $IxPage[$p.Id] = $p }
@@ -3005,15 +4488,73 @@ $ContactHtml
             }
 
             # ============================================================
-            # PAGE 4 : OPTIMISATION DU PARC — inactivité et stockage
+            # PAGE 4 : SANTÉ & PROACTIVITÉ — [FUSION v4 - Proactivité]
+            # Santé des postes (14 vérifications) + inactivité et stockage (ex-page
+            # "Optimisation du parc", conservée à l'identique pour les paliers d'inactivité)
             # ============================================================
-            if ($HasOptim) {
-                Get-IxPageStart -Page $IxPage['optimisation']
+            if ($HasSante) {
+                Get-IxPageStart -Page $IxPage['sante']
+
+                if ($HealthData) {
+                    New-HTMLSection -HeaderText "Fleet Health & Proactivity" -HeaderTextSize 14 -HeaderBackGroundColor $Colors.Health -CanCollapse {
+                        New-HTMLPanel {
+                            New-HTMLText -Text $HealthHeadHtml -FontSize 1
+                        }
+                    }
+                }
 
                 # [v3.2] Cartes inactivité / stockage (auparavant dans "Devices Overview")
-                New-HTMLSection -HeaderText "Inactive Devices & Storage" -HeaderTextSize 14 -HeaderBackGroundColor $Colors.Primary -CanCollapse {
-                    New-HTMLPanel {
-                        New-HTMLText -Text $OptimHtml -FontSize 1
+                if ($OptimHtml) {
+                    New-HTMLSection -HeaderText "Inactive Devices & Storage" -HeaderTextSize 14 -HeaderBackGroundColor $Colors.Primary -CanCollapse {
+                        New-HTMLPanel {
+                            New-HTMLText -Text $OptimHtml -FontSize 1
+                        }
+                    }
+                }
+
+                if ($HealthData -and @($HealthData.Rows).Count -gt 0) {
+                    New-HTMLSection -Height 380 -HeaderText "Health Overview & Top Actions" -HeaderTextSize 14 -HeaderBackGroundColor $Colors.Health -CanCollapse {
+                        New-HTMLPanel {
+                            New-HTMLChart -Gradient {
+                                New-ChartDonut -Name "Critique"     -Value $HealthData.CritCount -Color $Colors.Danger
+                                New-ChartDonut -Name "À surveiller" -Value $HealthData.WarnCount -Color $Colors.Warning
+                                New-ChartDonut -Name "OK"           -Value $HealthData.OkCount   -Color $Colors.Success
+                            } -Title "Sévérité des postes" -TitleAlignment center -TitleColor $Colors.Primary
+                        }
+                        if ($HealthActions.Count -gt 0) {
+                            New-HTMLPanel {
+                                New-HTMLChart -Gradient {
+                                    foreach ($hAction in ($HealthActions | Select-Object -First 10)) { New-ChartBar -Name $hAction.'Action recommandée' -Value $hAction.'Postes concernés' }
+                                    New-ChartLegend -Name "Postes concernés"
+                                } -Title "Top 10 des actions de remédiation" -TitleAlignment center -TitleColor $Colors.Primary
+                            }
+                        }
+                    }
+
+                    New-HTMLSection -HeaderText "Remediation Actions (Summary)" -HeaderTextSize 14 -HeaderBackGroundColor $Colors.DetailTables -CanCollapse {
+                        New-HTMLPanel {
+                            if ($HealthActions.Count -gt 0) {
+                                New-HTMLTable -DataTable $HealthActions -Filtering -PagingLength 25
+                            } else {
+                                New-HTMLText -Text (New-IxEmptyState -Icon 'check' -Tone 'success' -Title "Aucune action de remédiation nécessaire" -Text "Tous les indicateurs collectés sont dans les seuils.") -FontSize 1
+                            }
+                        }
+                    }
+
+                    if ($HealthActions.Count -gt 0) {
+                        New-HTMLSection -HeaderText "Remediation Actions (Device Detail)" -HeaderTextSize 14 -HeaderBackGroundColor $Colors.DetailTables -CanCollapse -Collapsed {
+                            New-HTMLTable -DataTable @(Select-HealthActionDetailView -Actions $HealthData.Actions) -Filtering -PagingLength 50
+                        }
+                    }
+
+                    New-HTMLSection -HeaderText "Device Health (All Indicators)" -HeaderTextSize 14 -HeaderBackGroundColor $Colors.DetailTables -CanCollapse -Collapsed {
+                        New-HTMLTable -DataTable @(Select-HealthDeviceView -Rows $HealthData.Rows) -Filtering -PagingLength 50
+                    }
+
+                    if ($HealthChecks.Disk -and ($DiskCritCount + $DiskWarnCount) -gt 0) {
+                        New-HTMLSection -HeaderText "Devices with Low Disk Space (< $($RemediationThresholds.DiskFreePctWarning) % free)" -HeaderTextSize 14 -HeaderBackGroundColor $Colors.DetailTables -CanCollapse -Collapsed {
+                            New-HTMLTable -DataTable @(Select-HealthDiskView -Rows $HealthData.Rows) -Filtering -PagingLength 50
+                        }
                     }
                 }
 
@@ -3023,12 +4564,6 @@ $ContactHtml
                     $devices = $InactiveDevicesByThreshold["$days"]
                     New-HTMLSection -HeaderText "Inactive Devices ($days+ days)" -HeaderTextSize 14 -HeaderBackGroundColor $color -CanCollapse -Collapsed {
                         New-HTMLTable -DataTable ($devices | Select-Object DeviceName, UserPrincipalName, OperatingSystem, Manufacturer, Model, OSVersion, ComplianceState, IsEncrypted, LastSyncDateTime, EnrolledDateTime | Sort-Object LastSyncDateTime) -Filtering -PagingLength 50
-                    }
-                }
-
-                if ($ShowLowStorage) {
-                    New-HTMLSection -HeaderText "Devices with Low Storage (< 100 GB)" -HeaderTextSize 14 -HeaderBackGroundColor $Colors.DetailTables -CanCollapse -Collapsed {
-                        New-HTMLTable -DataTable ($LowStorageDevices | Select-Object DeviceName, UserPrincipalName, OperatingSystem, Manufacturer, Model, OSVersion, ComplianceState, IsEncrypted, LastSyncDateTime, EnrolledDateTime, @{Name="FreeSpaceGB";Expression={[math]::Round($_.FreeStorageSpaceInBytes / 1GB, 2)}} | Sort-Object FreeSpaceGB) -Filtering -PagingLength 50
                     }
                 }
 
@@ -3047,24 +4582,26 @@ $ContactHtml
         if ($OpenAfterGeneration) { $message += "`n`nLe rapport s'ouvre automatiquement dans votre navigateur." }
         else                      { $message += "`n`nLe rapport est disponible dans le dossier de sortie." }
 
-        # [v3.3] Bilan de l'analyse des non-conformités (exports CSV, erreurs API)
-        if ($NcCsvFiles.Count -gt 0) {
-            $message += "`n`nSynthèses CSV des non-conformités ($($NcCsvFiles.Count) fichiers) :`n$NcCsvFolder"
+        # [v4.0] Exports CSV et avertissements de toutes les sections (API, droits, Endpoint Analytics)
+        if ($ExportFiles.Count -gt 0) {
+            $message += "`n`n$($ExportFiles.Count) fichier(s) CSV :`n$ExportFolder"
         }
         if ($NcResult -and -not $NcResult.Success) {
             $lblStatus.Text = "⚠ Dashboard généré - analyse des non-conformités indisponible"; $lblStatus.ForeColor = [System.Drawing.Color]::DarkOrange
-            $message += "`n`n⚠ Analyse des non-conformités indisponible :`n$($NcResult.Error)"
-        } elseif ($NcResult -and $NcResult.Warnings.Count -gt 0) {
-            $message += "`n`n⚠ $($NcResult.Warnings.Count) avertissement(s) sur l'analyse des non-conformités (détail dans le dashboard) :`n- " + ($NcResult.Warnings -join "`n- ")
         }
-        Show-InfoMessage $message
+        $warnText = Get-RunWarningsText -NcResult $NcResult -RunWarnings $RunWarnings -HealthWarnings $HealthWarnings
+        if ($warnText) { Write-Log ($warnText.Trim()) -Level WARN }
+        Write-Log "SUCCÈS - Rapport : $OutputFolder\$ReportFileName" -Level OK
+        Show-InfoMessage ($message + $warnText)
 
     } catch {
         $lblStatus.Text = "❌ Erreur lors de la génération"; $lblStatus.ForeColor = [System.Drawing.Color]::Red
-        Show-ErrorMessage "Erreur lors de la génération du dashboard :`n`n$($_.Exception.Message)"
+        Write-Log "ÉCHEC - $($_.Exception.Message)" -Level ERROR
+        Write-Log "Ligne : $($_.InvocationInfo.ScriptLineNumber) / Trace : $($_.ScriptStackTrace)" -Level ERROR
+        Show-ErrorMessage "Erreur lors de la génération du dashboard :`n`n$($_.Exception.Message)`n`n(Détail complet dans $LogFile)"
     } finally {
         # [v3.3] Le secret client et le cache d'analyse ne survivent pas à la génération
-        $script:GraphAuth       = $null
+        $script:GraphContext    = $null
         $script:NcSettingsCache = $null
     }
 }
@@ -3074,7 +4611,7 @@ $ContactHtml
 # ========================================
 
 $form = New-Object System.Windows.Forms.Form
-$form.Text            = "Intune Dashboard v3.3"
+$form.Text            = "Intune Dashboard v4.0 - All-In-One"
 $form.Size            = New-Object System.Drawing.Size(980, 700)
 $form.StartPosition   = "CenterScreen"
 $form.FormBorderStyle = "FixedDialog"
@@ -3103,7 +4640,7 @@ $form.Controls.Add($headerPanel)
 $lblTitle           = New-Object System.Windows.Forms.Label
 $lblTitle.Location  = New-Object System.Drawing.Point(30, 20)
 $lblTitle.Size      = New-Object System.Drawing.Size(900, 50)
-$lblTitle.Text      = "Intune Dashboard  —  v3.3"
+$lblTitle.Text      = "Intune Dashboard  —  v4.0 All-In-One"
 $lblTitle.Font      = New-Object System.Drawing.Font("Segoe UI", 18, [System.Drawing.FontStyle]::Bold)
 $lblTitle.ForeColor = [System.Drawing.Color]::White
 $lblTitle.BackColor = [System.Drawing.Color]::Transparent
@@ -3161,6 +4698,46 @@ $chkAnonymize.Text     = "🔒  Anonymiser les données sensibles (format : User
 $chkAnonymize.Checked  = $false
 $chkAnonymize.Font     = New-Object System.Drawing.Font("Segoe UI", 9)
 $grpOptions.Controls.Add($chkAnonymize)
+
+# [v4.0] Sortie : rapport HTML facultatif, exports CSV de toutes les sections
+$grpOutput          = New-Object System.Windows.Forms.GroupBox
+$grpOutput.Location = New-Object System.Drawing.Point(30, 180)
+$grpOutput.Size     = New-Object System.Drawing.Size(860, 125)
+$grpOutput.Text     = " Sortie "
+$grpOutput.Font     = New-Object System.Drawing.Font("Segoe UI", 10, [System.Drawing.FontStyle]::Bold)
+$tabConfig.Controls.Add($grpOutput)
+
+$chkGenerateHtml          = New-Object System.Windows.Forms.CheckBox
+$chkGenerateHtml.Location = New-Object System.Drawing.Point(20, 28)
+$chkGenerateHtml.Size     = New-Object System.Drawing.Size(820, 25)
+$chkGenerateHtml.Text     = "🌐  Générer le rapport HTML (dashboard à onglets, module PSWriteHTML)"
+$chkGenerateHtml.Checked  = $true
+$chkGenerateHtml.Font     = New-Object System.Drawing.Font("Segoe UI", 9)
+$grpOutput.Controls.Add($chkGenerateHtml)
+
+$chkExportCsv          = New-Object System.Windows.Forms.CheckBox
+$chkExportCsv.Location = New-Object System.Drawing.Point(20, 58)
+$chkExportCsv.Size     = New-Object System.Drawing.Size(820, 25)
+$chkExportCsv.Text     = "📄  Exporter toutes les données collectées en CSV (dossier horodaté dans $OutputFolder)"
+$chkExportCsv.Checked  = $true
+$chkExportCsv.Font     = New-Object System.Drawing.Font("Segoe UI", 9)
+$grpOutput.Controls.Add($chkExportCsv)
+
+$lblOutputInfo           = New-Object System.Windows.Forms.Label
+$lblOutputInfo.Location  = New-Object System.Drawing.Point(20, 88)
+$lblOutputInfo.Size      = New-Object System.Drawing.Size(820, 30)
+$lblOutputInfo.Text      = "Sans HTML, seules les requêtes Graph et les exports CSV sont exécutés (aucun module requis) ; « Générer et Ouvrir » ouvre alors le dossier des exports."
+$lblOutputInfo.Font      = New-Object System.Drawing.Font("Segoe UI", 8, [System.Drawing.FontStyle]::Italic)
+$lblOutputInfo.ForeColor = [System.Drawing.Color]::Gray
+$grpOutput.Controls.Add($lblOutputInfo)
+
+# Sans HTML, l'export CSV devient la seule sortie : il est forcé
+$chkGenerateHtml.Add_CheckedChanged({
+    if (-not $chkGenerateHtml.Checked) { $chkExportCsv.Checked = $true }
+    $chkExportCsv.Enabled = $chkGenerateHtml.Checked
+    $btnGenerateOnly.Text = if ($chkGenerateHtml.Checked) { "Générer le Dashboard" } else { "Collecter et exporter" }
+    $btnGenerateOpen.Text = if ($chkGenerateHtml.Checked) { "Générer et Ouvrir" } else { "Exporter et ouvrir le dossier" }
+})
 
 # ========================================
 # ONGLET 2 : CONTACT
@@ -3248,7 +4825,7 @@ $tabContent.Controls.Add($lblContentInfo)
 # Sections principales
 $grpMainSections          = New-Object System.Windows.Forms.GroupBox
 $grpMainSections.Location = New-Object System.Drawing.Point(30, 48)
-$grpMainSections.Size     = New-Object System.Drawing.Size(430, 185)
+$grpMainSections.Size     = New-Object System.Drawing.Size(430, 220)
 $grpMainSections.Text     = " Sections principales "
 $grpMainSections.Font     = New-Object System.Drawing.Font("Segoe UI", 10, [System.Drawing.FontStyle]::Bold)
 $tabContent.Controls.Add($grpMainSections)
@@ -3283,25 +4860,33 @@ $chkHardware.Text     = "Hardware & OS Versions"; $chkHardware.Checked = $true
 $chkHardware.Font     = New-Object System.Drawing.Font("Segoe UI", 9)
 $grpMainSections.Controls.Add($chkHardware)
 
+# [FUSION v4 - Proactivité] Case maître de l'analyse de santé des postes (le détail des
+# 14 vérifications se règle dans l'onglet « Proactivité »)
+$chkHealth          = New-Object System.Windows.Forms.CheckBox
+$chkHealth.Location = New-Object System.Drawing.Point(20, 190); $chkHealth.Size = New-Object System.Drawing.Size(390, 25)
+$chkHealth.Text     = "Santé & proactivité des postes (Endpoint Analytics)"; $chkHealth.Checked = $true
+$chkHealth.Font     = New-Object System.Drawing.Font("Segoe UI", 9)
+$grpMainSections.Controls.Add($chkHealth)
+
 # Sections supplémentaires (vides - déplacées dans Affichage)
 $grpExtraSections          = New-Object System.Windows.Forms.GroupBox
 $grpExtraSections.Location = New-Object System.Drawing.Point(480, 48)
-$grpExtraSections.Size     = New-Object System.Drawing.Size(430, 185)
+$grpExtraSections.Size     = New-Object System.Drawing.Size(430, 220)
 $grpExtraSections.Text     = " Info "
 $grpExtraSections.Font     = New-Object System.Drawing.Font("Segoe UI", 10, [System.Drawing.FontStyle]::Bold)
 $tabContent.Controls.Add($grpExtraSections)
 
 $lblExtraInfo           = New-Object System.Windows.Forms.Label
 $lblExtraInfo.Location  = New-Object System.Drawing.Point(20, 35)
-$lblExtraInfo.Size      = New-Object System.Drawing.Size(395, 60)
-$lblExtraInfo.Text      = "Les options d'affichage des plateformes, des appareils inactifs et du Low Storage se configurent dans l'onglet « Affichage »."
+$lblExtraInfo.Size      = New-Object System.Drawing.Size(395, 140)
+$lblExtraInfo.Text      = "Les plateformes et les paliers d'appareils inactifs se configurent dans l'onglet « Affichage ».`n`nLes 14 vérifications de santé (disque, Endpoint Analytics, batteries, BitLocker, Defender...) et la collecte parallèle se configurent dans l'onglet « Proactivité ».`n`nLa génération HTML et les exports CSV se règlent dans l'onglet « Configuration »."
 $lblExtraInfo.Font      = New-Object System.Drawing.Font("Segoe UI", 9, [System.Drawing.FontStyle]::Italic)
 $lblExtraInfo.ForeColor = [System.Drawing.Color]::FromArgb(0, 120, 212)
 $grpExtraSections.Controls.Add($lblExtraInfo)
 
 # Boutons tout sélectionner / tout désélectionner
 $btnSelectAll           = New-Object System.Windows.Forms.Button
-$btnSelectAll.Location  = New-Object System.Drawing.Point(30, 250)
+$btnSelectAll.Location  = New-Object System.Drawing.Point(30, 280)
 $btnSelectAll.Size      = New-Object System.Drawing.Size(200, 35)
 $btnSelectAll.Text      = "Tout sélectionner"
 $btnSelectAll.Font      = New-Object System.Drawing.Font("Segoe UI", 9, [System.Drawing.FontStyle]::Bold)
@@ -3313,11 +4898,12 @@ $btnSelectAll.Add_Click({
     $chkCompliance.Checked   = $true; $chkEncryption.Checked  = $true
     $chkApplications.Checked = $true; $chkUpdateRings.Checked = $true
     $chkHardware.Checked     = $true; $chkNcAnalysis.Checked  = $true
+    $chkHealth.Checked       = $true
 })
 $tabContent.Controls.Add($btnSelectAll)
 
 $btnDeselectAll           = New-Object System.Windows.Forms.Button
-$btnDeselectAll.Location  = New-Object System.Drawing.Point(245, 250)
+$btnDeselectAll.Location  = New-Object System.Drawing.Point(245, 280)
 $btnDeselectAll.Size      = New-Object System.Drawing.Size(200, 35)
 $btnDeselectAll.Text      = "Tout désélectionner"
 $btnDeselectAll.Font      = New-Object System.Drawing.Font("Segoe UI", 9, [System.Drawing.FontStyle]::Bold)
@@ -3329,13 +4915,14 @@ $btnDeselectAll.Add_Click({
     $chkCompliance.Checked   = $false; $chkEncryption.Checked  = $false
     $chkApplications.Checked = $false; $chkUpdateRings.Checked = $false
     $chkHardware.Checked     = $false; $chkNcAnalysis.Checked  = $false
+    $chkHealth.Checked       = $false
 })
 $tabContent.Controls.Add($btnDeselectAll)
 
 # [v3.3] Analyse des non-conformités (page "Sécurité & conformité")
 $grpNonCompliance          = New-Object System.Windows.Forms.GroupBox
-$grpNonCompliance.Location = New-Object System.Drawing.Point(30, 300)
-$grpNonCompliance.Size     = New-Object System.Drawing.Size(880, 125)
+$grpNonCompliance.Location = New-Object System.Drawing.Point(30, 330)
+$grpNonCompliance.Size     = New-Object System.Drawing.Size(880, 95)
 $grpNonCompliance.Text     = " Sécurité & conformité — analyse des non-conformités (API Graph) "
 $grpNonCompliance.Font     = New-Object System.Drawing.Font("Segoe UI", 10, [System.Drawing.FontStyle]::Bold)
 $tabContent.Controls.Add($grpNonCompliance)
@@ -3346,15 +4933,9 @@ $chkNcAnalysis.Text     = "🔎  Analyser les raisons de non-conformité (catég
 $chkNcAnalysis.Font     = New-Object System.Drawing.Font("Segoe UI", 9)
 $grpNonCompliance.Controls.Add($chkNcAnalysis)
 
-$chkNcCsv          = New-Object System.Windows.Forms.CheckBox
-$chkNcCsv.Location = New-Object System.Drawing.Point(20, 58); $chkNcCsv.Size = New-Object System.Drawing.Size(840, 25)
-$chkNcCsv.Text     = "📄  Exporter les synthèses au format CSV (sous-dossier horodaté dans $OutputFolder)"; $chkNcCsv.Checked = $true
-$chkNcCsv.Font     = New-Object System.Drawing.Font("Segoe UI", 9)
-$grpNonCompliance.Controls.Add($chkNcCsv)
-$chkNcAnalysis.Add_CheckedChanged({ $chkNcCsv.Enabled = $chkNcAnalysis.Checked })
-
+# [v4.0] L'export CSV des synthèses est désormais global (onglet Configuration > Sortie)
 $lblNcInfo           = New-Object System.Windows.Forms.Label
-$lblNcInfo.Location  = New-Object System.Drawing.Point(20, 88)
+$lblNcInfo.Location  = New-Object System.Drawing.Point(20, 58)
 $lblNcInfo.Size      = New-Object System.Drawing.Size(840, 30)
 $lblNcInfo.Text      = "Données lues en direct (rapport Intune « Noncompliant devices and settings », repli par appareil). Permissions Graph (Application) : DeviceManagementManagedDevices.Read.All, DeviceManagementConfiguration.Read.All."
 $lblNcInfo.Font      = New-Object System.Drawing.Font("Segoe UI", 8, [System.Drawing.FontStyle]::Italic)
@@ -3373,7 +4954,7 @@ $tabControl.Controls.Add($tabAffichage)
 $lblAffichageInfo           = New-Object System.Windows.Forms.Label
 $lblAffichageInfo.Location  = New-Object System.Drawing.Point(30, 15)
 $lblAffichageInfo.Size      = New-Object System.Drawing.Size(860, 25)
-$lblAffichageInfo.Text      = "Choisissez quelles données afficher dans la section 'Devices Overview'"
+$lblAffichageInfo.Text      = "Plateformes de la page « Vue d'ensemble » et paliers d'inactivité de la page « Santé & proactivité »"
 $lblAffichageInfo.Font      = New-Object System.Drawing.Font("Segoe UI", 10, [System.Drawing.FontStyle]::Italic)
 $lblAffichageInfo.ForeColor = [System.Drawing.Color]::Gray
 $tabAffichage.Controls.Add($lblAffichageInfo)
@@ -3426,19 +5007,8 @@ $btnDeselectAllPlatforms.Font      = New-Object System.Drawing.Font("Segoe UI", 
 $btnDeselectAllPlatforms.Add_Click({ $chkShowWindows.Checked = $false; $chkShowIOS.Checked = $false; $chkShowAndroid.Checked = $false; $chkShowMac.Checked = $false })
 $grpPlateformes.Controls.Add($btnDeselectAllPlatforms)
 
-# --- Groupe Low Storage ---
-$grpLowStorage          = New-Object System.Windows.Forms.GroupBox
-$grpLowStorage.Location = New-Object System.Drawing.Point(30, 190)
-$grpLowStorage.Size     = New-Object System.Drawing.Size(430, 65)
-$grpLowStorage.Text     = " Low Storage "
-$grpLowStorage.Font     = New-Object System.Drawing.Font("Segoe UI", 10, [System.Drawing.FontStyle]::Bold)
-$tabAffichage.Controls.Add($grpLowStorage)
-
-$chkLowStorage          = New-Object System.Windows.Forms.CheckBox
-$chkLowStorage.Location = New-Object System.Drawing.Point(20, 28); $chkLowStorage.Size = New-Object System.Drawing.Size(395, 25)
-$chkLowStorage.Text     = "💾  Afficher les appareils avec peu d'espace disque (< 100 GB)"
-$chkLowStorage.Checked  = $true; $chkLowStorage.Font = New-Object System.Drawing.Font("Segoe UI", 9)
-$grpLowStorage.Controls.Add($chkLowStorage)
+# [v4.0] Groupe "Low Storage (< 100 GB)" retiré : l'espace disque est évalué en %
+# par la vérification "Espace disque" de l'onglet « Proactivité ».
 
 # --- Groupe Inactive Devices ---
 $grpInactive          = New-Object System.Windows.Forms.GroupBox
@@ -3492,6 +5062,104 @@ $btnDeselectAllInactive.BackColor = [System.Drawing.Color]::FromArgb(220, 53, 69
 $btnDeselectAllInactive.Font      = New-Object System.Drawing.Font("Segoe UI", 8, [System.Drawing.FontStyle]::Bold)
 $btnDeselectAllInactive.Add_Click({ foreach ($d in $inactiveDays) { $inactiveChecks["$d"].Checked = $false } })
 $grpInactive.Controls.Add($btnDeselectAllInactive)
+
+# ========================================
+# [FUSION v4 - Proactivité] ONGLET 5 : PROACTIVITÉ (santé des postes)
+# ========================================
+# Une case par vérification (seuil en info-bulle) : une vérification décochée n'est
+# ni collectée ni affichée. Repris de l'onglet "Remédiation avancée" du script
+# Proactivité (les imports de fichiers et les actions Sync / Reboot n'en font pas partie).
+
+$tabProactivite           = New-Object System.Windows.Forms.TabPage
+$tabProactivite.Text      = "Proactivité"
+$tabProactivite.BackColor = [System.Drawing.Color]::White
+$tabControl.Controls.Add($tabProactivite)
+
+$tipHealth              = New-Object System.Windows.Forms.ToolTip
+$tipHealth.AutoPopDelay = 25000
+$tipHealth.InitialDelay = 350
+
+$grpHealthChecks          = New-Object System.Windows.Forms.GroupBox
+$grpHealthChecks.Location = New-Object System.Drawing.Point(30, 15)
+$grpHealthChecks.Size     = New-Object System.Drawing.Size(880, 190)
+$grpHealthChecks.Text     = " Vérifications de la page « Santé & proactivité » "
+$grpHealthChecks.Font     = New-Object System.Drawing.Font("Segoe UI", 10, [System.Drawing.FontStyle]::Bold)
+$tabProactivite.Controls.Add($grpHealthChecks)
+
+$lblHealthChecksInfo           = New-Object System.Windows.Forms.Label
+$lblHealthChecksInfo.Location  = New-Object System.Drawing.Point(20, 25)
+$lblHealthChecksInfo.Size      = New-Object System.Drawing.Size(840, 20)
+$lblHealthChecksInfo.Text      = "Une vérification décochée n'est ni collectée ni affichée (aucun appel Graph). Survolez une case pour voir son seuil."
+$lblHealthChecksInfo.Font      = New-Object System.Drawing.Font("Segoe UI", 8, [System.Drawing.FontStyle]::Italic)
+$lblHealthChecksInfo.ForeColor = [System.Drawing.Color]::Gray
+$grpHealthChecks.Controls.Add($lblHealthChecksInfo)
+
+$script:ChkHealthChecks = @{}
+foreach ($def in $HealthCheckDefs) {
+    $c          = New-Object System.Windows.Forms.CheckBox
+    $c.Location = New-Object System.Drawing.Point((20 + $def.Col * 212), (52 + $def.Row * 32))
+    $c.Size     = New-Object System.Drawing.Size(205, 25)
+    $c.Text     = $def.Text
+    $c.Checked  = $true
+    $c.Font     = New-Object System.Drawing.Font("Segoe UI", 9)
+    $tipHealth.SetToolTip($c, $def.Hint)
+    $grpHealthChecks.Controls.Add($c)
+    $script:ChkHealthChecks[$def.Key] = $c
+}
+
+$btnSelectAllHealth           = New-Object System.Windows.Forms.Button
+$btnSelectAllHealth.Location  = New-Object System.Drawing.Point(30, 215)
+$btnSelectAllHealth.Size      = New-Object System.Drawing.Size(200, 32)
+$btnSelectAllHealth.Text      = "Toutes les vérifications"
+$btnSelectAllHealth.Font      = New-Object System.Drawing.Font("Segoe UI", 9, [System.Drawing.FontStyle]::Bold)
+$btnSelectAllHealth.FlatStyle = "Flat"
+$btnSelectAllHealth.BackColor = [System.Drawing.Color]::FromArgb(40, 167, 69)
+$btnSelectAllHealth.ForeColor = [System.Drawing.Color]::White
+$btnSelectAllHealth.Cursor    = [System.Windows.Forms.Cursors]::Hand
+$btnSelectAllHealth.Add_Click({ foreach ($c in $script:ChkHealthChecks.Values) { $c.Checked = $true } })
+$tabProactivite.Controls.Add($btnSelectAllHealth)
+
+$btnDeselectAllHealth           = New-Object System.Windows.Forms.Button
+$btnDeselectAllHealth.Location  = New-Object System.Drawing.Point(245, 215)
+$btnDeselectAllHealth.Size      = New-Object System.Drawing.Size(200, 32)
+$btnDeselectAllHealth.Text      = "Aucune vérification"
+$btnDeselectAllHealth.Font      = New-Object System.Drawing.Font("Segoe UI", 9, [System.Drawing.FontStyle]::Bold)
+$btnDeselectAllHealth.FlatStyle = "Flat"
+$btnDeselectAllHealth.BackColor = [System.Drawing.Color]::FromArgb(220, 53, 69)
+$btnDeselectAllHealth.ForeColor = [System.Drawing.Color]::White
+$btnDeselectAllHealth.Cursor    = [System.Windows.Forms.Cursors]::Hand
+$btnDeselectAllHealth.Add_Click({ foreach ($c in $script:ChkHealthChecks.Values) { $c.Checked = $false } })
+$tabProactivite.Controls.Add($btnDeselectAllHealth)
+
+$grpHealthCollect          = New-Object System.Windows.Forms.GroupBox
+$grpHealthCollect.Location = New-Object System.Drawing.Point(30, 260)
+$grpHealthCollect.Size     = New-Object System.Drawing.Size(880, 150)
+$grpHealthCollect.Text     = " Collecte "
+$grpHealthCollect.Font     = New-Object System.Drawing.Font("Segoe UI", 10, [System.Drawing.FontStyle]::Bold)
+$tabProactivite.Controls.Add($grpHealthCollect)
+
+$chkParallel          = New-Object System.Windows.Forms.CheckBox
+$chkParallel.Location = New-Object System.Drawing.Point(20, 28)
+$chkParallel.Size     = New-Object System.Drawing.Size(840, 25)
+$chkParallel.Text     = "⚡  Collecte parallèle des listes Endpoint Analytics et BitLocker ($MaxParallelCollections flux, pause commune en cas de limitation Graph)"
+$chkParallel.Checked  = $true
+$chkParallel.Font     = New-Object System.Drawing.Font("Segoe UI", 9)
+$grpHealthCollect.Controls.Add($chkParallel)
+
+$lblHealthCollectInfo           = New-Object System.Windows.Forms.Label
+$lblHealthCollectInfo.Location  = New-Object System.Drawing.Point(20, 60)
+$lblHealthCollectInfo.Size      = New-Object System.Drawing.Size(840, 82)
+$lblHealthCollectInfo.Text      = "Prérequis : l'Analyse des points de terminaison doit être activée dans Intune (sinon, seuls le disque, l'inactivité, la conformité, Defender, les mises à jour et les profils sont évalués).`nPermissions Graph (Application) : DeviceManagementManagedDevices.Read.All, DeviceManagementConfiguration.Read.All.`nSeuils modifiables en tête de script (`$RemediationThresholds). Journal détaillé : $LogFile"
+$lblHealthCollectInfo.Font      = New-Object System.Drawing.Font("Segoe UI", 8, [System.Drawing.FontStyle]::Italic)
+$lblHealthCollectInfo.ForeColor = [System.Drawing.Color]::Gray
+$grpHealthCollect.Controls.Add($lblHealthCollectInfo)
+
+# La case maître (onglet Contenu) active ou grise l'ensemble des vérifications
+$chkHealth.Add_CheckedChanged({
+    $grpHealthChecks.Enabled      = $chkHealth.Checked
+    $btnSelectAllHealth.Enabled   = $chkHealth.Checked
+    $btnDeselectAllHealth.Enabled = $chkHealth.Checked
+})
 
 # ========================================
 # BOUTONS DE GÉNÉRATION
