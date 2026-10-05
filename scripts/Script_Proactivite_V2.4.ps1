@@ -34,6 +34,10 @@
 # Nouveautés V2.3 : TOUTES les applications découvertes ont leur liste de postes par défaut
 #               (case « Toutes les applications », cochée) ; la limite aux N plus répandues
 #               (50 auparavant, appliquée sans le dire) n'est plus qu'une option. Balise [V2.3].
+# Nouveautés V2.4 : onglet 2, case « Masquer les applications et composants Windows », cochée
+#               par défaut (applications intégrées, composants système, bibliothèques du Store,
+#               mises à jour KB) ; pastille « Windows » ; règles modifiables en tête de script
+#               ($WindowsComponentPatterns / $WindowsComponentExceptions). Balise [V2.4].
 # Auteur : ECONOCOM
 # ============================================================
 
@@ -72,6 +76,35 @@ $AnonClientLabel = "X"
 # Dossier des fichiers d'import / d'export de donnees brutes (mode hors ligne).
 # Utilise par la collecte "Import de fichiers" et par l'option d'export des donnees collectees.
 $ImportFolder = "C:\temp\imports"
+# [V2.4] Applications et composants WINDOWS, masqués par défaut dans l'onglet 2 du rapport
+# (une case du rapport les réaffiche) : applications intégrées à Windows, composants
+# système, bibliothèques du Store, mises à jour (KB). Une application est classée "Windows"
+# si son nom correspond à l'un de ces motifs ET à aucune exception (expressions régulières,
+# casse ignorée) ou si son éditeur est "CN=Microsoft Windows" (signature des paquets système).
+$WindowsComponentPatterns = @(
+    # Paquets AppX/MSIX de Windows, sous leur nom d'identité (sans espace) :
+    # Microsoft.WindowsCalculator, MicrosoftWindows.Client.WebExperience, Microsoft.VCLibs.140.00,
+    # Microsoft.XboxGameOverlay, windows.immersivecontrolpanel...
+    '^(Microsoft|MicrosoftWindows|MicrosoftCorporationII|Windows)\.[\w.\-]+$'
+    # Paquets système nommés par un GUID (1527c705-839a-4832-9118-54d4Bd6a0c89...)
+    '^\{?[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\}?$'
+    # Autres paquets système et Teams "Conversation" intégré à Windows 11
+    '^(NcsiUwpApp|InputApp|MicrosoftTeams)$'
+    # Mises à jour et correctifs Windows
+    '\bKB\d{6,8}\b'
+    '^(Security )?Update for (Microsoft )?Windows\b'
+    '^Mise à jour (de sécurité )?(pour|de) (Microsoft )?Windows\b'
+    # Outils et composants système installés par Windows Update
+    '^Microsoft Update Health Tools$'
+    '^(Windows PC Health Check|Contrôle d''intégrité du PC Windows)$'
+    '^Microsoft Edge (Update|WebView2 Runtime)$'
+    '^Microsoft GameInput$'
+    '^Windows (Driver Package|Feature Experience Pack|Web Experience Pack)\b'
+)
+# Exceptions : applications Microsoft distribuées par l'entreprise, toujours affichées
+$WindowsComponentExceptions = @(
+    '^Microsoft\.(CompanyPortal|RemoteDesktop|Whiteboard|PowerBI\w*|MicrosoftPowerBIDesktop)$'
+)
 
 # ===== PERFORMANCE DE LA COLLECTE =====
 # Les collectes de listes indépendantes (scores, performances, BitLocker, batteries,
@@ -1554,6 +1587,7 @@ function Get-DiscoveredAppsReportFromImport {
     }
 
     $apps = @($apps | Sort-Object -Property deviceCount -Descending)
+    Set-WindowsComponentFlags -Apps $apps   # [V2.4]
 
     # Les données étant locales, aucune limite d'appels n'est nécessaire : le détail est
     # affiché pour toutes les applications qui en disposent, dans la limite du Top N demandé
@@ -1786,6 +1820,43 @@ function Update-SourceModeUi {
 # PAGE 2 - DISCOVERED APPS (APPLICATIONS DÉCOUVERTES)
 # ========================================
 
+function Test-WindowsComponentApp {
+    <#
+        [V2.4] $true si l'application découverte est une application ou un composant de
+        Windows (voir $WindowsComponentPatterns / $WindowsComponentExceptions). Les motifs
+        sont compilés une fois puis gardés en cache (des milliers d'applications par tenant).
+    #>
+    param([string]$Name, [string]$Publisher)
+    if ($null -eq $script:WinCompRegex) {
+        $opts = [System.Text.RegularExpressions.RegexOptions]'IgnoreCase, CultureInvariant'
+        $script:WinCompRegex = @(foreach ($p in @($WindowsComponentPatterns)) { if ($p) { New-Object System.Text.RegularExpressions.Regex($p, $opts) } })
+        $script:WinCompExcept = @(foreach ($p in @($WindowsComponentExceptions)) { if ($p) { New-Object System.Text.RegularExpressions.Regex($p, $opts) } })
+    }
+    $n = ([string]$Name).Trim()
+    if (-not $n) { return $false }
+    foreach ($rx in $script:WinCompExcept) { if ($rx.IsMatch($n)) { return $false } }
+    if (([string]$Publisher).Trim() -match '^CN=Microsoft Windows\b') { return $true }
+    foreach ($rx in $script:WinCompRegex) { if ($rx.IsMatch($n)) { return $true } }
+    return $false
+}
+
+function Set-WindowsComponentFlags {
+    <#
+        [V2.4] Pose la propriété IsWindowsComponent sur chaque application découverte. Appelée
+        à la COLLECTE, avant l'anonymisation : une application renommée "apps_12" dans le
+        rapport reste ainsi correctement classée (la copie anonymisée garde la propriété).
+    #>
+    param([array]$Apps)
+    $count = 0
+    foreach ($app in @($Apps)) {
+        if ($null -eq $app) { continue }
+        $flag = Test-WindowsComponentApp -Name ([string]$app.displayName) -Publisher ([string]$app.publisher)
+        if ($flag) { $count++ }
+        $app | Add-Member -NotePropertyName IsWindowsComponent -NotePropertyValue $flag -Force
+    }
+    Write-Log "Applications découvertes : $count application(s) ou composant(s) Windows sur $(@($Apps).Count) (masqués par défaut dans le rapport)." -Level INFO
+}
+
 function ConvertTo-GraphRelativeUrl {
     <# [V2.2] Lien Graph absolu (@odata.nextLink) -> chemin relatif, seule forme acceptée
        dans une sous-requête $batch. #>
@@ -1859,6 +1930,7 @@ function Get-DiscoveredAppsReport {
     $Url     = "https://graph.microsoft.com/beta/deviceManagement/detectedApps?`$top=999"
     $AllApps = @(Get-GraphPagedResults -Url $Url -AccessToken $AccessToken -ProgressCallback $ProgressCallback)
     $AllApps = @($AllApps | Sort-Object -Property deviceCount -Descending)
+    Set-WindowsComponentFlags -Apps $AllApps   # [V2.4]
 
     $AppsToDetail = if ($TopNDetailed -gt 0) { @($AllApps | Select-Object -First $TopNDetailed) } else { @($AllApps) }
     $AppsToDetail = @($AppsToDetail | Where-Object { $_ -and $_.id })
@@ -5329,6 +5401,12 @@ function Build-AppAccordionHtml {
         $appSlug = ConvertTo-Slug ([string]$app.displayName)
         $expBtn  = Build-AccordionExportButton -Label ([string]$app.displayName)
 
+        # [V2.4] Application ou composant Windows : repéré (pastille) et masquable dans le rapport.
+        # Drapeau posé à la collecte, avant anonymisation ; à défaut, classement sur le nom.
+        $isWin = if ($app.PSObject.Properties['IsWindowsComponent']) { [bool]$app.IsWindowsComponent } else { Test-WindowsComponentApp -Name ([string]$app.displayName) -Publisher ([string]$app.publisher) }
+        $winAttr = if ($isWin) { " data-win='1'" } else { "" }
+        $winChip = if ($isWin) { "<span class='chip chip-win' title='Application int&eacute;gr&eacute;e ou composant de Windows'>Windows</span>" } else { "" }
+
         $devices = @()
         if ($detailed.Contains([string]$app.id) -and $DevicesByApp -and $DevicesByApp.ContainsKey($app.id)) { $devices = @($DevicesByApp[$app.id]) }
 
@@ -5354,7 +5432,7 @@ function Build-AppAccordionHtml {
             }
             $appsJson.Add('"' + $key + '":[' + ($idx -join ',') + ']')
 
-            [void]$sb.Append("<details class='acc app' data-search='$search' data-export-name='application-$appSlug' data-app='$key' data-count='$count'><summary><span class='acc-title'>$name</span>$pubHtml$verChip<span class='badge badge-blue'>$count poste(s)</span>$expBtn<span class='chev'>&rsaquo;</span></summary><div class='acc-body'>")
+            [void]$sb.Append("<details class='acc app' data-search='$search' data-export-name='application-$appSlug' data-app='$key' data-count='$count'$winAttr><summary><span class='acc-title'>$name</span>$winChip$pubHtml$verChip<span class='badge badge-blue'>$count poste(s)</span>$expBtn<span class='chev'>&rsaquo;</span></summary><div class='acc-body'>")
             if ($TruncatedApps -and $TruncatedApps.ContainsKey($app.id)) {
                 $why = ConvertTo-HtmlSafe ([string]$TruncatedApps[$app.id])
                 if ($TruncatedApps[$app.id] -is [bool]) { $why = "liste limit&eacute;e &agrave; la premi&egrave;re page" }
@@ -5362,7 +5440,7 @@ function Build-AppAccordionHtml {
             }
             [void]$sb.Append("<div class='devpager' data-app='$key'><div class='note note-info'>Liste des postes&nbsp;: d&eacute;pliez l'application pour l'afficher (JavaScript requis).</div></div>")
         } else {
-            [void]$sb.Append("<details class='acc app' data-search='$search' data-export-name='application-$appSlug'><summary><span class='acc-title'>$name</span>$pubHtml$verChip<span class='badge badge-blue'>$count poste(s)</span>$expBtn<span class='chev'>&rsaquo;</span></summary><div class='acc-body'>")
+            [void]$sb.Append("<details class='acc app' data-search='$search' data-export-name='application-$appSlug'$winAttr><summary><span class='acc-title'>$name</span>$winChip$pubHtml$verChip<span class='badge badge-blue'>$count poste(s)</span>$expBtn<span class='chev'>&rsaquo;</span></summary><div class='acc-body'>")
             if ($detailed.Contains([string]$app.id)) {
                 [void]$sb.Append("<div class='note note-info'>Aucun poste associ&eacute; &agrave; cette application dans les donn&eacute;es collect&eacute;es.</div>")
             } else {
@@ -5700,6 +5778,17 @@ function Build-DashboardHtml {
     # [V2.2] Listes de postes complètes : le texte indique pour combien d'applications
     $appsDetailText = if ($detailedN -ge $appsTotal -and $appsTotal -gt 0) { "La liste nominative compl&egrave;te des postes est disponible pour <b>toutes</b> les applications." } `
                       else { "La liste nominative compl&egrave;te des postes est disponible pour les <b>$detailedN</b> applications les plus r&eacute;pandues." }
+    # [V2.4] Applications et composants Windows (même règle que les pastilles des accordéons)
+    $winCount = @($DiscoveredApps.AllApps | Where-Object {
+        $_ -and $(if ($_.PSObject.Properties['IsWindowsComponent']) { [bool]$_.IsWindowsComponent } else { Test-WindowsComponentApp -Name ([string]$_.displayName) -Publisher ([string]$_.publisher) })
+    }).Count
+    $appsShownByDefault = $appsTotal - $winCount
+    $winFilterHtml = ""
+    $winSubText    = ""
+    if ($winCount -gt 0) {
+        $winFilterHtml = "<label class='fcheck' title='Applications int&eacute;gr&eacute;es &agrave; Windows, composants syst&egrave;me, biblioth&egrave;ques du Store, mises &agrave; jour (KB)'><input type='checkbox' id='hideWinApps' checked onchange='toggleWinApps(this)'><span>Masquer les applications et composants Windows (<b>$winCount</b>)</span></label>"
+        $winSubText    = " Les <b>$winCount</b> applications et composants Windows (applications int&eacute;gr&eacute;es, biblioth&egrave;ques du Store, mises &agrave; jour) sont masqu&eacute;s par d&eacute;faut&nbsp;: d&eacute;cochez la case pour les afficher."
+    }
     $appsHtml  = Build-AppAccordionHtml -Apps $DiscoveredApps.AllApps -DevicesByApp $DiscoveredApps.DevicesByApp -DetailedIds $DiscoveredApps.DetailedIds -TopNDetailed $TopNDetailed -TruncatedApps $DiscoveredApps.TruncatedApps
 
     # ---------- Onglet 3 : inventaire ----------
@@ -5929,6 +6018,13 @@ main{padding:18px 16px 60px}
 .tbl tbody td.pg-empty{padding:22px;text-align:center;color:#94a3b8;font-style:italic}
 @media (max-width:720px){.pg-info{margin-left:0;width:100%}}
 @media print{.pg-bar,.pg-nav{display:none!important}}
+/* [V2.4] Case "Masquer les applications et composants Windows" et pastille "Windows" */
+.fcheck{display:inline-flex;align-items:center;gap:8px;border:1.5px solid #dfe4ec;background:#fff;border-radius:999px;padding:7px 15px 7px 12px;font-size:12.3px;font-weight:600;color:#475569;cursor:pointer;user-select:none;transition:all .13s}
+.fcheck:hover{border-color:#b9a1d4}
+.fcheck input{width:15px;height:15px;margin:0;accent-color:#5B2C8F;cursor:pointer}
+.fcheck:has(input:checked){background:#f5f0fb;border-color:#b9a1d4;color:#5B2C8F}
+.fcheck:focus-within{outline:3px solid #7B3FA8;outline-offset:1px}
+.chip-win{background:#e0f2fe;color:#0369a1}
 '@
 
     # ---------- JavaScript (statique, vanilla ES5, aucune dépendance) ----------
@@ -5952,7 +6048,7 @@ main{padding:18px 16px 60px}
   'use strict';
 
   var DEBOUNCE_MS = 120;
-  var state = { global: '', apps: '', inv: '', rem: '', invStatus: 'all', remStatus: 'all' };
+  var state = { global: '', apps: '', inv: '', rem: '', invStatus: 'all', remStatus: 'all', hideWin: false };
   var panels = [], allRows = [], allAccs = [];
   var reportPrefix = 'rapport-intune';
   var timer = null;
@@ -5993,6 +6089,7 @@ main{padding:18px 16px 60px}
           el: accEl,
           panel: panel,
           isApp: accEl.className.indexOf('app') > -1,
+          isWin: accEl.getAttribute('data-win') === '1',
           hay: norm((accEl.getAttribute('data-search') || '') + ' ' + (summary ? summary.textContent : '')),
           rows: [],
           selfHit: true,
@@ -6046,6 +6143,8 @@ main{padding:18px 16px 60px}
   }
 
   function localAccMatch(acc) {
+    /* [V2.4] Applications et composants Windows masques tant que la case est cochee */
+    if (acc.isApp && acc.isWin && state.hideWin) { return false; }
     if (acc.isApp && state.apps) { return acc.hay.indexOf(state.apps) > -1; }
     return true;
   }
@@ -6187,6 +6286,7 @@ main{padding:18px 16px 60px}
     apply();
   };
 
+  window.toggleWinApps = function (el) { state.hideWin = !!(el && el.checked); apply(); };
   window.filterApps = function () { var el = byId('appSearch'); state.apps = el ? norm(el.value) : ''; schedule(); };
   window.filterInv  = function () { var el = byId('invSearch'); state.inv  = el ? norm(el.value) : ''; schedule(); };
   window.filterRem  = function () { var el = byId('remSearch'); state.rem  = el ? norm(el.value) : ''; schedule(); };
@@ -6723,6 +6823,9 @@ main{padding:18px 16px 60px}
   function init() {
     var prefix = document.body ? document.body.getAttribute('data-report-prefix') : null;
     if (prefix) { reportPrefix = prefix; }
+    /* [V2.4] Etat initial de la case (le navigateur peut la restaurer au rechargement) */
+    var winBox = byId('hideWinApps');
+    state.hideWin = !!(winBox && winBox.checked);
     buildIndex();
     initDevicePagers();
     initTabKeyboard();
@@ -6793,13 +6896,14 @@ main{padding:18px 16px 60px}
     $panelT2 = @"
   <div class="card">
     <h2><span class="h-dot blue"></span>Applications d&eacute;couvertes sur le parc</h2>
-    <p class="sub">$appsTotal application(s) d&eacute;tect&eacute;e(s), tri&eacute;es par nombre de postes d&eacute;croissant. $appsDetailText D&eacute;pliez une application&nbsp;: ses postes s'affichent par tranches de 20, avec une recherche et un export CSV de la liste compl&egrave;te.</p>
+    <p class="sub">$appsTotal application(s) d&eacute;tect&eacute;e(s), tri&eacute;es par nombre de postes d&eacute;croissant. $appsDetailText D&eacute;pliez une application&nbsp;: ses postes s'affichent par tranches de 20, avec une recherche et un export CSV de la liste compl&egrave;te.$winSubText</p>
     <div class="toolbar">
       <input id="appSearch" class="search" type="search" placeholder="&#128269;  Rechercher une application ou un &eacute;diteur..." oninput="filterApps()">
       <button type="button" class="btn" onclick="setAppsOpen(true)">Tout d&eacute;plier</button>
       <button type="button" class="btn" onclick="setAppsOpen(false)">Tout replier</button>
       <button type="button" class="btn btn-export" onclick="exportAllAccordions('appList','applications-decouvertes','Application',this)">&#11015; Exporter (CSV)</button>
-      <span class="count-info" role="status" aria-live="polite"><b id="appCount">$appsTotal</b> / $appsTotal affich&eacute;e(s)</span>
+      $winFilterHtml
+      <span class="count-info" role="status" aria-live="polite"><b id="appCount">$appsShownByDefault</b> / $appsTotal affich&eacute;e(s)</span>
     </div>
     <div id="appList">
 $appsHtml
