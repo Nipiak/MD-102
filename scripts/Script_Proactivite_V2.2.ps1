@@ -19,6 +19,18 @@
 #               sensibles (X), avec table de correspondance confidentielle à côté du rapport.
 #               AUCUN module externe requis (ni PSWriteHTML, ni Microsoft.Graph) : rendu HTML
 #               sur mesure, fichier 100% autonome consultable hors ligne.
+# Nouveautés V2.2 (onglet 2 "Applications découvertes") :
+#               - liste COMPLÈTE des postes de chaque application détaillée : toutes les pages
+#                 Graph sont lues (fin de "Affichage limité aux 999 premiers postes"), les
+#                 pages suivantes étant elles aussi groupées par 20 dans des appels $batch
+#               - "Nombre d'applications à détailler" = 0 : toutes les applications
+#               - postes affichés par tranches de 20 (pagination), recherche par poste /
+#                 utilisateur / OS dans chaque application, export CSV de la liste complète
+#                 ou filtrée ; la recherche globale trouve aussi les postes non affichés
+#               - données des postes stockées une seule fois (bloc JSON compact) au lieu d'un
+#                 tableau HTML par application : rapport plus léger et plus rapide à ouvrir
+#               - masquage des termes sensibles étendu à ces données
+#               Les ajouts sont repérés par la balise [V2.2].
 # Auteur : ECONOCOM
 # ============================================================
 
@@ -1531,16 +1543,10 @@ function Get-DiscoveredAppsReportFromImport {
     }
 
     if ($AnonymizeData -and $devicesByApp.Count -gt 0) {
+        # [V2.2] Un objet anonymisé par poste, partagé par toutes ses applications
+        $anonCache = @{}
         foreach ($k in @($devicesByApp.Keys)) {
-            $devicesByApp[$k] = @($devicesByApp[$k] | ForEach-Object {
-                $anon = Get-AnonymizedIdentity -RealName (Get-PropCI $_ @('deviceName', 'DeviceName')) -RealUpn (Get-PropCI $_ @('userPrincipalName', 'UserPrincipalName'))
-                [PSCustomObject]@{
-                    deviceName        = $anon.Name
-                    userPrincipalName = $anon.Upn
-                    operatingSystem   = $_.operatingSystem
-                    osVersion         = $_.osVersion
-                }
-            })
+            $devicesByApp[$k] = ConvertTo-AnonymizedDeviceList -Devices $devicesByApp[$k] -Cache $anonCache
         }
     }
 
@@ -1665,11 +1671,13 @@ function Export-RawCollectedData {
             Export-Csv -Path $p -NoTypeInformation -Encoding UTF8 -Delimiter ';'
         $written += $p
 
-        $appDeviceRows = @()
+        # [V2.2] List au lieu de "+=" (recopie complète du tableau à chaque ligne) : les listes
+        # de postes étant désormais complètes, elles peuvent compter des centaines de milliers de lignes
+        $appDeviceRows = New-Object System.Collections.Generic.List[psobject]
         foreach ($app in $DiscoveredApps.AllApps) {
             if (-not $DiscoveredApps.DevicesByApp.ContainsKey($app.id)) { continue }
             foreach ($d in @($DiscoveredApps.DevicesByApp[$app.id])) {
-                $appDeviceRows += [PSCustomObject]@{
+                $appDeviceRows.Add([PSCustomObject]@{
                     appId             = $app.id
                     applicationName   = $app.displayName
                     version           = $app.version
@@ -1677,7 +1685,7 @@ function Export-RawCollectedData {
                     userPrincipalName = $d.userPrincipalName
                     operatingSystem   = $d.operatingSystem
                     osVersion         = $d.osVersion
-                }
+                })
             }
         }
         if ($appDeviceRows.Count -gt 0) {
@@ -1775,73 +1783,178 @@ function Update-SourceModeUi {
 # PAGE 2 - DISCOVERED APPS (APPLICATIONS DÉCOUVERTES)
 # ========================================
 
+function ConvertTo-GraphRelativeUrl {
+    <# [V2.2] Lien Graph absolu (@odata.nextLink) -> chemin relatif, seule forme acceptée
+       dans une sous-requête $batch. #>
+    param([string]$Url)
+    return ([string]$Url -replace '^https://graph\.microsoft\.com/(beta|v1\.0)', '')
+}
+
+function ConvertTo-AnonymizedDeviceList {
+    <#
+        [V2.2] Pseudonymise une liste de postes (deviceName / userPrincipalName). Le même poste
+        figure dans des centaines de listes (une par application installée) : le cache
+        $Cache garde UN objet anonymisé par poste, partagé par toutes ces listes, au lieu
+        d'un appel et d'un objet par ligne (des centaines de milliers sur un grand parc).
+    #>
+    param([array]$Devices, [hashtable]$Cache)
+    $out = New-Object System.Collections.Generic.List[psobject]
+    foreach ($d in @($Devices)) {
+        if ($null -eq $d) { continue }
+        $realName = [string](Get-PropCI $d @('deviceName', 'DeviceName'))
+        $realUpn  = [string](Get-PropCI $d @('userPrincipalName', 'UserPrincipalName'))
+        $os       = [string](Get-PropCI $d @('operatingSystem', 'OperatingSystem'))
+        $osVer    = [string](Get-PropCI $d @('osVersion', 'OSVersion'))
+        $key      = "$realName`t$realUpn`t$os`t$osVer"
+        if (-not $Cache.ContainsKey($key)) {
+            $anon = Get-AnonymizedIdentity -RealName $realName -RealUpn $realUpn
+            $Cache[$key] = [PSCustomObject]@{
+                deviceName        = $anon.Name
+                userPrincipalName = $anon.Upn
+                operatingSystem   = $os
+                osVersion         = $osVer
+            }
+        }
+        $out.Add($Cache[$key])
+    }
+    return $out.ToArray()
+}
+
 function Get-DiscoveredAppsReport {
     <#
         Récupère l'ensemble des detectedApps du tenant (paginé), triées par nombre
         de postes décroissant (deviceCount est déjà fourni par Graph, sans appel
-        supplémentaire). Pour limiter le volume d'appels API (un tenant peut avoir
-        des dizaines de milliers d'applications détectées), seul le détail des
-        postes des $TopNDetailed premières applications est chargé (via $batch).
+        supplémentaire), puis la liste des postes des $TopNDetailed premières
+        applications (0 = toutes).
+
+        [V2.2] La liste des postes de chaque application détaillée est désormais COMPLÈTE :
+          * toutes les pages (@odata.nextLink) sont lues, et plus seulement la première
+            (999 postes au plus : "Affichage limité aux 999 premiers postes collectés") ;
+          * les pages suivantes passent, elles aussi, par $batch, regroupées par 20 TOUTES
+            APPLICATIONS CONFONDUES : une application à 7 423 postes coûte 8 sous-requêtes,
+            servies avec celles des autres applications, au lieu de 8 appels séquentiels.
+            C'était la pagination séquentielle, application par application, qui provoquait
+            le throttling quasi continu constaté avant (d'où l'abandon du nextLink), pas le
+            nombre de postes lui-même ;
+          * $TopNDetailed = 0 : toutes les applications sont détaillées (comme en mode import ;
+            auparavant, 0 n'en détaillait aucune en mode API) ;
+          * une page en échec définitif (après les nouvelles tentatives de Invoke-GraphBatch)
+            marque la liste comme INCOMPLÈTE, avec la raison : le rapport l'indique au lieu
+            de présenter une liste partielle comme complète.
     #>
     param(
         [Parameter(Mandatory = $true)][string]$AccessToken,
         [int]$TopNDetailed = 50,
         [bool]$AnonymizeData = $false,
-        [scriptblock]$ProgressCallback
+        [scriptblock]$ProgressCallback,
+        # Garde-fou : 200 pages de 999 postes = près de 200 000 postes pour UNE application
+        [int]$MaxPagesPerApp = 200
     )
 
     if ($ProgressCallback) { & $ProgressCallback "Récupération de la liste des applications découvertes..." }
 
     $Url     = "https://graph.microsoft.com/beta/deviceManagement/detectedApps?`$top=999"
-    $AllApps = Get-GraphPagedResults -Url $Url -AccessToken $AccessToken -ProgressCallback $ProgressCallback
-    $AllApps = $AllApps | Sort-Object -Property deviceCount -Descending
+    $AllApps = @(Get-GraphPagedResults -Url $Url -AccessToken $AccessToken -ProgressCallback $ProgressCallback)
+    $AllApps = @($AllApps | Sort-Object -Property deviceCount -Descending)
 
-    $AppsToDetail = $AllApps | Select-Object -First $TopNDetailed
-    $DetailedIds  = @($AppsToDetail | ForEach-Object { $_.id })
+    $AppsToDetail = if ($TopNDetailed -gt 0) { @($AllApps | Select-Object -First $TopNDetailed) } else { @($AllApps) }
+    $AppsToDetail = @($AppsToDetail | Where-Object { $_ -and $_.id })
+    $DetailedIds  = @($AppsToDetail | ForEach-Object { [string]$_.id })
 
-    $deviceRequests = @()
+    $lists         = @{}   # id application -> List des postes
+    $truncatedApps = @{}   # id application -> raison d'une liste incomplète
+    $pending       = New-Object System.Collections.Generic.List[psobject]
     foreach ($app in $AppsToDetail) {
-        $deviceRequests += @{
-            id     = $app.id
-            method = "GET"
-            url    = "/deviceManagement/detectedApps/$($app.id)/managedDevices?`$select=deviceName,userPrincipalName,operatingSystem,osVersion&`$top=999"
-        }
+        $appId = [string]$app.id
+        $lists[$appId] = New-Object System.Collections.Generic.List[psobject]
+        # Une application annoncée sur aucun poste n'a rien à lister : aucun appel
+        $declared = 0
+        try { $declared = [int]$app.deviceCount } catch { }
+        if ($declared -le 0) { continue }
+        $pending.Add([PSCustomObject]@{
+            AppId = $appId
+            Page  = 1
+            Url   = "/deviceManagement/detectedApps/$appId/managedDevices?`$select=deviceName,userPrincipalName,operatingSystem,osVersion&`$top=999"
+        })
     }
+    $expectedLinks = 0
+    foreach ($app in $AppsToDetail) { try { $expectedLinks += [int]$app.deviceCount } catch { } }
+    $scopeLabel = if ($TopNDetailed -gt 0) { "les $($AppsToDetail.Count) applications les plus répandues" } else { "les $($AppsToDetail.Count) applications (toutes)" }
+    Write-Log "Postes par application : $scopeLabel, environ $expectedLinks couple(s) application/poste annoncé(s) par Intune." -Level INFO
 
-    $devicesByApp   = @{}
-    $truncatedApps  = @{}
-    if ($deviceRequests.Count -gt 0) {
-        if ($ProgressCallback) { & $ProgressCallback "Récupération du détail des postes pour les $($AppsToDetail.Count) applications les plus répandues..." }
-        $deviceResponses = Invoke-GraphBatch -Requests $deviceRequests -AccessToken $AccessToken -ProgressCallback $ProgressCallback
-        foreach ($resp in $deviceResponses) {
-            $list = @()
-            if ($resp.body -and $resp.body.value) { $list += $resp.body.value }
+    # Pagination "en largeur" : à chaque passe, la page suivante de TOUTES les listes
+    # inachevées est demandée en même temps, par lots de 20.
+    $pass         = 0
+    $subRequests  = 0
+    while ($pending.Count -gt 0) {
+        $pass++
+        $requests = New-Object System.Collections.Generic.List[psobject]
+        $byReqId  = @{}
+        $n        = 0
+        foreach ($p in $pending) {
+            $n++
+            # Id unique DANS la passe : l'id d'application seul ne suffit plus (plusieurs pages)
+            $rid = "p$n"
+            $byReqId[$rid] = $p
+            $requests.Add(@{ id = $rid; method = "GET"; url = $p.Url })
+        }
+        $subRequests += $requests.Count
+        $label = if ($pass -eq 1) { "Postes par application" } else { "Postes par application (pages suivantes, passe $pass)" }
+        if ($ProgressCallback) { & $ProgressCallback "$label : $($requests.Count) liste(s) à lire..." }
 
-            # IMPORTANT : on ne suit PAS le '@odata.nextLink' ici. Pour une application très
-            # répandue (proche de 100% du parc), Graph peut paginer en interne même avec
-            # $top=999 (page réellement plus petite côté serveur), ce qui forcerait des dizaines
-            # d'appels séquentiels supplémentaires PAR application - c'est justement ce qui
-            # provoquait un throttling quasi continu et des générations de 10+ minutes.
-            # On se limite donc à la première page reçue et on l'indique clairement à l'écran ;
-            # le nombre total de postes (deviceCount) reste de toute façon affiché.
-            if ($resp.body -and $resp.body.'@odata.nextLink') {
-                $truncatedApps[$resp.id] = $true
+        $responses = @()
+        try {
+            $responses = @(Invoke-GraphBatch -Requests $requests.ToArray() -AccessToken $AccessToken -ProgressCallback $ProgressCallback -Label $label)
+        } catch {
+            # Appel $batch en échec définitif : les listes déjà lues sont gardées, les autres
+            # sont signalées incomplètes plutôt que de faire échouer tout le rapport.
+            Write-Log "Postes par application : $($_.Exception.Message)" -Level WARN
+            foreach ($p in $pending) { $truncatedApps[$p.AppId] = "erreur Graph sur la page $($p.Page) ($($_.Exception.Message))" }
+            break
+        }
+
+        $next     = New-Object System.Collections.Generic.List[psobject]
+        $answered = New-Object System.Collections.Generic.HashSet[string]
+        foreach ($resp in $responses) {
+            if ($null -eq $resp) { continue }
+            $rid = [string]$resp.id
+            if (-not $byReqId.ContainsKey($rid)) { continue }
+            [void]$answered.Add($rid)
+            $p = $byReqId[$rid]
+            $status = 0
+            try { $status = [int]$resp.status } catch { }
+            if ($status -ne 200 -or $null -eq $resp.body) {
+                $truncatedApps[$p.AppId] = "HTTP $status sur la page $($p.Page)"
+                continue
             }
-
-            if ($AnonymizeData -and $list.Count -gt 0) {
-                $list = $list | ForEach-Object {
-                    $anon = Get-AnonymizedIdentity -RealName (Get-PropCI $_ @('deviceName', 'DeviceName')) -RealUpn (Get-PropCI $_ @('userPrincipalName', 'UserPrincipalName'))
-                    [PSCustomObject]@{
-                        deviceName        = $anon.Name
-                        userPrincipalName = $anon.Upn
-                        operatingSystem   = $_.operatingSystem
-                        osVersion         = $_.osVersion
-                    }
+            foreach ($d in @($resp.body.value)) { if ($null -ne $d) { $lists[$p.AppId].Add($d) } }
+            $link = [string]$resp.body.'@odata.nextLink'
+            if ($link) {
+                if ($p.Page -ge $MaxPagesPerApp) {
+                    $truncatedApps[$p.AppId] = "plus de $MaxPagesPerApp pages"
+                } else {
+                    $next.Add([PSCustomObject]@{ AppId = $p.AppId; Page = $p.Page + 1; Url = (ConvertTo-GraphRelativeUrl $link) })
                 }
             }
-            $devicesByApp[$resp.id] = $list
         }
+        foreach ($rid in @($byReqId.Keys)) {
+            if (-not $answered.Contains($rid)) { $truncatedApps[$byReqId[$rid].AppId] = "page $($byReqId[$rid].Page) restée sans réponse" }
+        }
+        $pending = $next
     }
+
+    # Assemblage (+ pseudonymisation, un objet partagé par poste)
+    $devicesByApp = @{}
+    $anonCache    = @{}
+    $listed       = 0
+    foreach ($appId in $DetailedIds) {
+        $list = $lists[$appId].ToArray()
+        if ($AnonymizeData -and $list.Count -gt 0) { $list = ConvertTo-AnonymizedDeviceList -Devices $list -Cache $anonCache }
+        $devicesByApp[$appId] = $list
+        $listed += $list.Count
+    }
+    $level = if ($truncatedApps.Count -gt 0) { "WARN" } else { "OK" }
+    Write-Log "Postes par application : $listed couple(s) application/poste lu(s) en $subRequests sous-requête(s) ($pass passe(s)) ; $($truncatedApps.Count) liste(s) incomplète(s)." -Level $level
 
     return [PSCustomObject]@{
         AllApps        = $AllApps
@@ -3501,6 +3614,10 @@ function Protect-HtmlSensitiveTerms {
         en-tête, noms de stratégies et de profils, éditeurs, noms de paquets, attributs de
         recherche et d'export... Les blocs <style> et <script> ne sont jamais touchés, pour
         ne pas casser la mise en page ni le JavaScript.
+        [V2.2] Exception : les blocs de DONNÉES <script type='application/json'> (postes par
+        application) sont traités, mais uniquement dans leurs chaînes JSON : un nom de poste
+        ou un UPN contenant le nom du client y est masqué comme ailleurs, sans jamais toucher
+        à la structure (clés, numéros, ponctuation).
           * terme de 4 caractères ou plus : remplacé partout, y compris au sein d'un mot
             ("Allianz_CitrixWeb" -> "X_CitrixWeb") ;
           * terme plus court (sigle) : remplacé uniquement s'il forme un mot entier, pour
@@ -3546,7 +3663,22 @@ function Protect-HtmlSensitiveTerms {
     $parts = [regex]::Split($Html, '(?is)(<style\b.*?</style>|<script\b.*?</script>)')
     $sb = New-Object System.Text.StringBuilder ($Html.Length)
     $total = 0
+    # [V2.2] Remplacement limité aux chaînes JSON (entre guillemets doubles) des blocs de données
+    $jsonCount = @{ N = 0 }
+    $jsonLiteral = [System.Text.RegularExpressions.MatchEvaluator]{
+        param($lit)
+        $text = $lit.Value
+        foreach ($rx in $regexes) {
+            $jsonCount.N += $rx.Matches($text).Count
+            $text = $rx.Replace($text, $evaluator)
+        }
+        return $text
+    }.GetNewClosure()
     foreach ($part in $parts) {
+        if ($part -match '^(?is)<script\b[^>]*\btype\s*=\s*[''"]application/json[''"]') {
+            [void]$sb.Append([regex]::Replace($part, '"(?:[^"\\]|\\.)*"', $jsonLiteral))
+            continue
+        }
         if ($part -match '^(?is)<(style|script)\b') { [void]$sb.Append($part); continue }
         $seg = $part
         foreach ($rx in $regexes) {
@@ -3555,6 +3687,7 @@ function Protect-HtmlSensitiveTerms {
         }
         [void]$sb.Append($seg)
     }
+    $total += $jsonCount.N
     Write-Log "Anonymisation : $total occurrence(s) de terme(s) sensible(s) remplacée(s) par '$Replacement'." -Level INFO
     return $sb.ToString()
 }
@@ -5137,13 +5270,50 @@ function Build-ReasonAccordionHtml {
     return $sb.ToString()
 }
 
+function ConvertTo-JsonLiteral {
+    <#
+        [V2.2] Chaîne -> littéral JSON entre guillemets, pour le bloc de données du rapport.
+        "<" est échappé (<) : une valeur ne peut jamais refermer le bloc <script> qui
+        porte les données. Accents et "&" restent tels quels : le masquage des termes
+        sensibles (Protect-HtmlSensitiveTerms) doit pouvoir les reconnaître.
+    #>
+    param([AllowNull()][string]$Value)
+    if ([string]::IsNullOrEmpty($Value)) { return '""' }
+    $s = $Value.Replace('\', '\\').Replace('"', '\"')
+    # Remplacement par délégué seulement si nécessaire (rare) : convertir le bloc de code en
+    # MatchEvaluator à chaque appel coûtait ~15 s pour 30 000 valeurs
+    if ($s -match '[\x00-\x1f<\u2028\u2029]') {
+        $s = [regex]::Replace($s, '[\x00-\x1f<\u2028\u2029]', { param($m) '\u{0:x4}' -f [int][char]$m.Value })
+    }
+    return '"' + $s + '"'
+}
+
 function Build-AppAccordionHtml {
     <#
         Un <details>/<summary> natif par application (déplier/replier sans framework),
         avec attribut data-search pour le filtre instantané côté navigateur.
+
+        [V2.2] Les postes ne sont plus écrits en tableau HTML (une ligne par poste et par
+        application : des dizaines de Mo de DOM dès que les listes sont complètes) mais dans
+        UN bloc de données JSON compact, lu par le navigateur :
+          * chaque poste n'y figure qu'une fois ("dev") ; chaque application ne porte que
+            les numéros de ses postes ("apps") — 7 423 postes x 50 applications tiennent
+            en ~2 Mo au lieu de ~40 Mo de HTML ;
+          * la liste s'affiche à l'ouverture de l'application, 20 postes par page, avec une
+            recherche (poste, utilisateur, OS) et un export CSV de la liste complète ou filtrée.
+        Renvoie le HTML des accordéons suivi du bloc de données.
     #>
     param($Apps, $DevicesByApp, $DetailedIds, [int]$TopNDetailed, $TruncatedApps)
-    $sb = New-Object System.Text.StringBuilder
+    $sb       = New-Object System.Text.StringBuilder
+    $detailed = New-Object System.Collections.Generic.HashSet[string]
+    foreach ($id in @($DetailedIds)) { if ($id) { [void]$detailed.Add([string]$id) } }
+
+    # Table des postes (dédoublonnés) et listes de numéros par application
+    $devIndex = @{}
+    $devJson  = New-Object System.Collections.Generic.List[string]
+    $appsJson = New-Object System.Collections.Generic.List[string]
+    $key      = 0
+
     foreach ($app in $Apps) {
         $name      = ConvertTo-HtmlSafe $app.displayName
         $publisher = ConvertTo-HtmlSafe $app.publisher
@@ -5155,22 +5325,59 @@ function Build-AppAccordionHtml {
 
         $appSlug = ConvertTo-Slug ([string]$app.displayName)
         $expBtn  = Build-AccordionExportButton -Label ([string]$app.displayName)
-        [void]$sb.Append("<details class='acc app' data-search='$search' data-export-name='application-$appSlug'><summary><span class='acc-title'>$name</span>$pubHtml$verChip<span class='badge badge-blue'>$count poste(s)</span>$expBtn<span class='chev'>&rsaquo;</span></summary><div class='acc-body'>")
 
-        if ($DetailedIds -contains $app.id) {
-            $devices = $DevicesByApp[$app.id]
-            if ($devices -and $devices.Count -gt 0) {
-                if ($TruncatedApps -and $TruncatedApps.ContainsKey($app.id)) {
-                    [void]$sb.Append("<div class='note note-warn'>&#9888; Affichage limit&eacute; aux $($devices.Count) premiers postes collect&eacute;s sur $count au total (application tr&egrave;s r&eacute;pandue &mdash; liste compl&egrave;te non charg&eacute;e pour pr&eacute;server les performances).</div>")
+        $devices = @()
+        if ($detailed.Contains([string]$app.id) -and $DevicesByApp -and $DevicesByApp.ContainsKey($app.id)) { $devices = @($DevicesByApp[$app.id]) }
+
+        if ($devices.Count -gt 0) {
+            $key++
+            $idx = New-Object System.Collections.Generic.List[int]
+            foreach ($d in $devices) {
+                if ($null -eq $d) { continue }
+                # Boucle la plus sollicitée (un passage par couple application/poste : jusqu'à un
+                # million sur un grand parc) : accès direct aux propriétés (insensibles à la casse
+                # en PowerShell, sans Get-PropCI) et clé poste + utilisateur ; l'OS et sa version
+                # ne sont lus qu'à la première rencontre du poste.
+                $dn = [string]$d.deviceName
+                $up = [string]$d.userPrincipalName
+                $k  = $dn + "`t" + $up
+                $i  = $devIndex[$k]
+                if ($null -eq $i) {
+                    $i = $devJson.Count
+                    $devIndex[$k] = $i
+                    $devJson.Add('[' + (ConvertTo-JsonLiteral $dn) + ',' + (ConvertTo-JsonLiteral $up) + ',' + (ConvertTo-JsonLiteral ([string]$d.operatingSystem)) + ',' + (ConvertTo-JsonLiteral ([string]$d.osVersion)) + ']')
                 }
-                [void]$sb.Append((Build-DeviceTableHtml -Devices $devices -IncludeSync $false))
-            } else {
-                [void]$sb.Append("<div class='note note-info'>Aucun poste associ&eacute; &agrave; cette application dans les donn&eacute;es collect&eacute;es.</div>")
+                $idx.Add($i)
             }
+            $appsJson.Add('"' + $key + '":[' + ($idx -join ',') + ']')
+
+            [void]$sb.Append("<details class='acc app' data-search='$search' data-export-name='application-$appSlug' data-app='$key' data-count='$count'><summary><span class='acc-title'>$name</span>$pubHtml$verChip<span class='badge badge-blue'>$count poste(s)</span>$expBtn<span class='chev'>&rsaquo;</span></summary><div class='acc-body'>")
+            if ($TruncatedApps -and $TruncatedApps.ContainsKey($app.id)) {
+                $why = ConvertTo-HtmlSafe ([string]$TruncatedApps[$app.id])
+                if ($TruncatedApps[$app.id] -is [bool]) { $why = "liste limit&eacute;e &agrave; la premi&egrave;re page" }
+                [void]$sb.Append("<div class='note note-warn'>&#9888; Liste incompl&egrave;te&nbsp;: $($idx.Count) poste(s) collect&eacute;(s) sur $count annonc&eacute;(s) par Intune ($why). Relancez la g&eacute;n&eacute;ration pour compl&eacute;ter la liste.</div>")
+            }
+            [void]$sb.Append("<div class='devpager' data-app='$key'><div class='note note-info'>Liste des postes&nbsp;: d&eacute;pliez l'application pour l'afficher (JavaScript requis).</div></div>")
         } else {
-            [void]$sb.Append("<div class='note note-info'>D&eacute;tail non charg&eacute; (limite&nbsp;: Top $TopNDetailed applications par nombre de postes &mdash; ajustable dans l'outil &mdash; ou d&eacute;tail absent du fichier import&eacute;).</div>")
+            [void]$sb.Append("<details class='acc app' data-search='$search' data-export-name='application-$appSlug'><summary><span class='acc-title'>$name</span>$pubHtml$verChip<span class='badge badge-blue'>$count poste(s)</span>$expBtn<span class='chev'>&rsaquo;</span></summary><div class='acc-body'>")
+            if ($detailed.Contains([string]$app.id)) {
+                [void]$sb.Append("<div class='note note-info'>Aucun poste associ&eacute; &agrave; cette application dans les donn&eacute;es collect&eacute;es.</div>")
+            } else {
+                [void]$sb.Append("<div class='note note-info'>D&eacute;tail non charg&eacute;&nbsp;: seules les $TopNDetailed applications les plus r&eacute;pandues sont d&eacute;taill&eacute;es. R&eacute;glez &laquo;&nbsp;Nombre d'applications &agrave; d&eacute;tailler&nbsp;&raquo; sur 0 dans l'outil pour les d&eacute;tailler toutes (ou d&eacute;tail absent du fichier import&eacute;).</div>")
+            }
         }
         [void]$sb.Append("</div></details>")
+    }
+
+    # Bloc de données : guillemets simples sur la balise (le masquage des termes sensibles ne
+    # traite que les chaînes JSON entre guillemets doubles, jamais la balise elle-même)
+    if ($appsJson.Count -gt 0) {
+        [void]$sb.Append("<script type='application/json' id='appDeviceData'>")
+        [void]$sb.Append('{"cols":["Poste","Utilisateur","OS","Version OS"],"dev":[')
+        [void]$sb.Append(($devJson -join ','))
+        [void]$sb.Append('],"apps":{')
+        [void]$sb.Append(($appsJson -join ','))
+        [void]$sb.Append('}}</script>')
     }
     return $sb.ToString()
 }
@@ -5487,6 +5694,9 @@ function Build-DashboardHtml {
     # ---------- Onglet 2 : applications découvertes ----------
     $appsTotal = $DiscoveredApps.AllApps.Count
     $detailedN = $DiscoveredApps.DetailedIds.Count
+    # [V2.2] Listes de postes complètes : le texte indique pour combien d'applications
+    $appsDetailText = if ($detailedN -ge $appsTotal -and $appsTotal -gt 0) { "La liste nominative compl&egrave;te des postes est disponible pour <b>toutes</b> les applications." } `
+                      else { "La liste nominative compl&egrave;te des postes est disponible pour les <b>$detailedN</b> applications les plus r&eacute;pandues." }
     $appsHtml  = Build-AppAccordionHtml -Apps $DiscoveredApps.AllApps -DevicesByApp $DiscoveredApps.DevicesByApp -DetailedIds $DiscoveredApps.DetailedIds -TopNDetailed $TopNDetailed -TruncatedApps $DiscoveredApps.TruncatedApps
 
     # ---------- Onglet 3 : inventaire ----------
@@ -5701,6 +5911,21 @@ main{padding:18px 16px 60px}
 .gsearch-kbd{display:none}
 .gsearch-wrap{max-width:none}
 }
+/* [V2.2] Postes par application : pagination (20 postes par page), recherche, export */
+.pg-bar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:10px}
+.pg-bar .search{max-width:360px;padding:8px 13px;font-size:13px}
+.pg-info{font-size:12.5px;color:#64748b;margin-left:auto}
+.pg-info b{color:#1e293b}
+.tbl-scroll.pg-scroll{max-height:none}
+.pg-nav{display:flex;align-items:center;justify-content:center;gap:6px;margin-top:11px}
+.pg-btn{appearance:none;border:1.5px solid #dfe4ec;background:#fff;border-radius:8px;min-width:36px;padding:6px 10px;font:inherit;font-size:13px;font-weight:700;color:#475569;cursor:pointer;transition:all .13s}
+.pg-btn:hover:not([disabled]){background:#f5f0fb;border-color:#b9a1d4;color:#5B2C8F}
+.pg-btn:focus-visible{outline:3px solid #7B3FA8;outline-offset:1px}
+.pg-btn[disabled]{opacity:.4;cursor:default}
+.pg-page{font-size:12.8px;font-weight:600;color:#475569;padding:0 10px;min-width:110px;text-align:center}
+.tbl tbody td.pg-empty{padding:22px;text-align:center;color:#94a3b8;font-style:italic}
+@media (max-width:720px){.pg-info{margin-left:0;width:100%}}
+@media print{.pg-bar,.pg-nav{display:none!important}}
 '@
 
     # ---------- JavaScript (statique, vanilla ES5, aucune dépendance) ----------
@@ -5769,7 +5994,10 @@ main{padding:18px 16px 60px}
           rows: [],
           selfHit: true,
           visible: true,
-          autoOpened: false
+          autoOpened: false,
+          dataKey: accEl.getAttribute('data-app'),
+          pager: null,
+          pagerGlobal: ''
         };
         accEl.__acc = acc;
         panel.accs.push(acc);
@@ -5837,6 +6065,14 @@ main{padding:18px 16px 60px}
 
     allAccs.forEach(function (acc) {
       var childHit = false;
+      if (acc.dataKey !== null) {
+        /* [V2.2] Postes lus dans les donnees : la recherche globale trouve un poste
+           meme s'il n'est pas sur la page affichee ; la liste ouverte se filtre sur
+           la recherche (sauf si c'est l'application elle-meme qui correspond). */
+        acc.pagerGlobal = (query && !acc.selfHit) ? query : '';
+        if (acc.pagerGlobal) { childHit = appHasDeviceMatch(acc.dataKey, query); }
+        if (acc.pager) { acc.pager.setGlobal(acc.pagerGlobal); }
+      }
       for (var i = 0; i < acc.rows.length; i++) {
         if (acc.rows[i].visible) { childHit = true; break; }
       }
@@ -6112,6 +6348,16 @@ main{padding:18px 16px 60px}
     if (event) { event.preventDefault(); event.stopPropagation(); }
     var acc = closestAcc(btn);
     if (!acc) { return; }
+    /* [V2.2] Application : TOUS ses postes, lus dans les donnees (le tableau affiche
+       n'en montre que 20) */
+    var key = acc.getAttribute('data-app');
+    if (key !== null) {
+      var list = appIndexes(key);
+      if (list.length === 0) { flash(btn, 'Rien a exporter'); return; }
+      downloadCsv(fileBase(acc.getAttribute('data-export-name') || 'application'), devicesMatrix(list));
+      flash(btn, '\u2713 ' + list.length + ' poste(s)');
+      return;
+    }
     var table = acc.querySelector('table.tbl');
     if (!table) { flash(btn, 'Rien a exporter'); return; }
     downloadCsv(fileBase(acc.getAttribute('data-export-name') || 'extrait'), tableToMatrix(table, false));
@@ -6136,11 +6382,18 @@ main{padding:18px 16px 60px}
     var matrix = null;
     qsa('details.acc', container).forEach(function (accEl) {
       if (accEl.className.indexOf('hidden') > -1) { return; }
-      var table = accEl.querySelector('table.tbl');
-      if (!table) { return; }
       var titleEl = accEl.querySelector('.acc-title');
       var label = titleEl ? titleEl.textContent.replace(/\s+/g, ' ').trim() : '';
-      var sub = tableToMatrix(table, true);
+      var key = accEl.getAttribute('data-app');
+      var sub;
+      if (key !== null) {
+        /* [V2.2] Application : postes lus dans les donnees, filtres d'affichage compris */
+        sub = devicesMatrix(appExportIndexes(accEl.__acc, key));
+      } else {
+        var table = accEl.querySelector('table.tbl');
+        if (!table) { return; }
+        sub = tableToMatrix(table, true);
+      }
       if (sub.length < 2) { return; }
       if (!matrix) { matrix = [[firstColumnLabel].concat(sub[0])]; }
       for (var i = 1; i < sub.length; i++) { matrix.push([label].concat(sub[i])); }
@@ -6149,6 +6402,243 @@ main{padding:18px 16px 60px}
     downloadCsv(fileBase(name), matrix);
     flash(btn, '\u2713 Exporte');
   };
+
+  /* ---------------------------------------------------------------
+     [V2.2] Postes par application : liste complete, 20 postes par page.
+     Les postes sont lus dans le bloc JSON #appDeviceData (chaque poste une
+     seule fois, chaque application = les numeros de ses postes) et ne sont
+     rendus que pour l'application ouverte, page par page : le DOM reste
+     leger meme avec des listes de plusieurs milliers de postes.
+     --------------------------------------------------------------- */
+  var PAGE_SIZE = 20;
+  var appData = null;
+  var devHay = [];
+  var devMatch = { q: null, flags: null };
+
+  function loadAppData() {
+    if (appData) { return appData; }
+    appData = { cols: ['Poste', 'Utilisateur', 'OS', 'Version OS'], dev: [], apps: {} };
+    var holder = byId('appDeviceData');
+    if (holder) {
+      try {
+        var parsed = JSON.parse(holder.textContent || '{}');
+        if (parsed && parsed.dev && parsed.apps) { appData = parsed; }
+      } catch (e) { /* donnees illisibles : listes vides, le reste du rapport fonctionne */ }
+    }
+    devHay = new Array(appData.dev.length);
+    return appData;
+  }
+
+  function deviceHay(i) {
+    var h = devHay[i];
+    if (h === undefined) { h = norm(appData.dev[i].join(' ')); devHay[i] = h; }
+    return h;
+  }
+
+  function appIndexes(key) { var d = loadAppData(); return d.apps[key] || []; }
+
+  /* Postes correspondant a la recherche globale : calcules une fois par requete
+     (quelques milliers de postes), puis simple lecture pour chaque application. */
+  function deviceMatchFlags(query) {
+    if (devMatch.q === query) { return devMatch.flags; }
+    var d = loadAppData();
+    var flags = new Uint8Array(d.dev.length);
+    for (var i = 0; i < d.dev.length; i++) { if (deviceHay(i).indexOf(query) > -1) { flags[i] = 1; } }
+    devMatch = { q: query, flags: flags };
+    return flags;
+  }
+
+  function appHasDeviceMatch(key, query) {
+    var flags = deviceMatchFlags(query), list = appIndexes(key);
+    for (var i = 0; i < list.length; i++) { if (flags[list[i]]) { return true; } }
+    return false;
+  }
+
+  function filterIndexes(all, local, global) {
+    if (!local && !global) { return all; }
+    var out = [];
+    for (var i = 0; i < all.length; i++) {
+      var h = deviceHay(all[i]);
+      if ((!local || h.indexOf(local) > -1) && (!global || h.indexOf(global) > -1)) { out.push(all[i]); }
+    }
+    return out;
+  }
+
+  function devicesMatrix(indexes) {
+    var d = loadAppData();
+    var matrix = [(d.cols || ['Poste', 'Utilisateur', 'OS', 'Version OS']).slice()];
+    for (var i = 0; i < indexes.length; i++) { matrix.push(d.dev[indexes[i]]); }
+    return matrix;
+  }
+
+  function mk(tag, cls, text) {
+    var node = document.createElement(tag);
+    if (cls) { node.className = cls; }
+    if (text !== undefined && text !== null) { node.textContent = text; }
+    return node;
+  }
+
+  function Pager(acc, host) {
+    var self = this;
+    this.acc = acc;
+    this.all = appIndexes(acc.dataKey);
+    this.view = this.all;
+    this.page = 0;
+    this.local = '';
+    this.global = acc.pagerGlobal || '';
+    this.timer = null;
+    var cols = loadAppData().cols || ['Poste', 'Utilisateur', 'OS', 'Version OS'];
+
+    host.innerHTML = '';
+    var bar = mk('div', 'pg-bar');
+    this.input = mk('input', 'search pg-q');
+    this.input.type = 'search';
+    this.input.placeholder = '🔍  Rechercher un poste, un utilisateur, un OS...';
+    this.input.setAttribute('aria-label', 'Rechercher dans les postes de cette application');
+    this.input.addEventListener('input', function () {
+      if (self.timer) { clearTimeout(self.timer); }
+      self.timer = setTimeout(function () { self.timer = null; self.local = norm(self.input.value); self.filter(); }, DEBOUNCE_MS);
+    });
+    this.info = mk('span', 'pg-info');
+    this.info.setAttribute('role', 'status');
+    this.info.setAttribute('aria-live', 'polite');
+    var exportBtn = mk('button', 'btn btn-export', '⬇ Exporter la liste (CSV)');
+    exportBtn.type = 'button';
+    exportBtn.title = 'Exporte tous les postes de la liste, recherche comprise (pas seulement la page affichee)';
+    exportBtn.addEventListener('click', function () { self.exportCsv(exportBtn); });
+    bar.appendChild(this.input);
+    bar.appendChild(exportBtn);
+    bar.appendChild(this.info);
+
+    var scroll = mk('div', 'tbl-scroll pg-scroll');
+    var table = mk('table', 'tbl');
+    var thead = mk('thead'), headRow = mk('tr');
+    cols.forEach(function (c) { var th = mk('th', null, c); th.setAttribute('scope', 'col'); headRow.appendChild(th); });
+    thead.appendChild(headRow);
+    this.body = mk('tbody');
+    table.appendChild(thead);
+    table.appendChild(this.body);
+    scroll.appendChild(table);
+
+    var nav = mk('div', 'pg-nav');
+    nav.setAttribute('role', 'navigation');
+    nav.setAttribute('aria-label', 'Pagination des postes');
+    function navBtn(label, title, fn) {
+      var b = mk('button', 'pg-btn', label);
+      b.type = 'button';
+      b.title = title;
+      b.setAttribute('aria-label', title);
+      b.addEventListener('click', fn);
+      nav.appendChild(b);
+      return b;
+    }
+    this.bFirst  = navBtn('«', 'Premiere page', function () { self.go(0); });
+    this.bPrev   = navBtn('‹', 'Page precedente', function () { self.go(self.page - 1); });
+    this.pageLbl = mk('span', 'pg-page');
+    nav.appendChild(this.pageLbl);
+    this.bNext   = navBtn('›', 'Page suivante', function () { self.go(self.page + 1); });
+    this.bLast   = navBtn('»', 'Derniere page', function () { self.go(self.pages() - 1); });
+
+    host.appendChild(bar);
+    host.appendChild(scroll);
+    host.appendChild(nav);
+    this.filter();
+  }
+
+  Pager.prototype.pages = function () { return Math.max(1, Math.ceil(this.view.length / PAGE_SIZE)); };
+
+  Pager.prototype.setGlobal = function (query) {
+    if (query === this.global) { return; }
+    this.global = query;
+    this.filter();
+  };
+
+  Pager.prototype.filter = function () {
+    this.view = filterIndexes(this.all, this.local, this.global);
+    this.page = 0;
+    this.render();
+  };
+
+  Pager.prototype.go = function (page) {
+    this.page = Math.min(Math.max(0, page), this.pages() - 1);
+    this.render();
+  };
+
+  Pager.prototype.render = function () {
+    var d = loadAppData(), total = this.view.length, pages = this.pages();
+    if (this.page > pages - 1) { this.page = pages - 1; }
+    var start = this.page * PAGE_SIZE, end = Math.min(total, start + PAGE_SIZE);
+    var frag = document.createDocumentFragment();
+    for (var i = start; i < end; i++) {
+      var dev = d.dev[this.view[i]], tr = mk('tr');
+      tr.appendChild(mk('td', 'cell-strong', dev[0]));
+      tr.appendChild(mk('td', null, dev[1]));
+      tr.appendChild(mk('td', null, dev[2]));
+      tr.appendChild(mk('td', 'mono', dev[3]));
+      frag.appendChild(tr);
+    }
+    if (total === 0) {
+      var emptyRow = mk('tr'), cell = mk('td', 'pg-empty', 'Aucun poste ne correspond a la recherche.');
+      cell.colSpan = 4;
+      emptyRow.appendChild(cell);
+      frag.appendChild(emptyRow);
+    }
+    this.body.innerHTML = '';
+    this.body.appendChild(frag);
+
+    /* Texte construit en noeuds (pas d'innerHTML) : aucune valeur collectee n'est interpretee */
+    var filtered = (total !== this.all.length);
+    this.info.innerHTML = '';
+    if (total === 0) {
+      this.info.appendChild(document.createTextNode('0 poste'));
+    } else {
+      this.info.appendChild(mk('b', null, (start + 1) + '–' + end));
+      this.info.appendChild(document.createTextNode(' sur '));
+      this.info.appendChild(mk('b', null, String(total)));
+      this.info.appendChild(document.createTextNode(' poste(s)'));
+    }
+    if (filtered) {
+      this.info.appendChild(document.createTextNode(' · filtre sur ' + this.all.length));
+    } else {
+      var announced = parseInt(this.acc.el.getAttribute('data-count'), 10);
+      if (!isNaN(announced) && announced !== this.all.length) {
+        this.info.appendChild(document.createTextNode(' · Intune en annonce ' + announced));
+      }
+    }
+    this.pageLbl.textContent = 'Page ' + (total === 0 ? 0 : this.page + 1) + ' / ' + (total === 0 ? 0 : pages);
+    this.bFirst.disabled = this.bPrev.disabled = (this.page === 0);
+    this.bLast.disabled = this.bNext.disabled = (this.page >= pages - 1);
+  };
+
+  Pager.prototype.exportCsv = function (btn) {
+    if (this.view.length === 0) { flash(btn, 'Rien a exporter'); return; }
+    var filtered = (this.view.length !== this.all.length);
+    var name = (this.acc.el.getAttribute('data-export-name') || 'application') + (filtered ? '-filtre' : '');
+    downloadCsv(fileBase(name), devicesMatrix(this.view));
+    flash(btn, '✓ ' + this.view.length + ' poste(s) exporte(s)');
+  };
+
+  function ensurePager(acc) {
+    if (!acc || acc.dataKey === null || acc.pager) { return; }
+    var host = acc.el.querySelector('.devpager');
+    if (!host) { return; }
+    acc.pager = new Pager(acc, host);
+  }
+
+  /* Liste a exporter pour une application : celle du tableau ouvert (filtres compris),
+     sinon la liste complete restreinte par la recherche globale eventuelle. */
+  function appExportIndexes(acc, key) {
+    if (acc && acc.pager) { return acc.pager.view; }
+    return filterIndexes(appIndexes(key), '', (acc && acc.pagerGlobal) || '');
+  }
+
+  function initDevicePagers() {
+    allAccs.forEach(function (acc) {
+      if (acc.dataKey === null) { return; }
+      acc.el.addEventListener('toggle', function () { if (acc.el.open) { ensurePager(acc); } });
+      if (acc.el.open) { ensurePager(acc); }
+    });
+  }
 
   /* ---------------------------------------------------------------
      Copie d'une commande PowerShell ciblant un poste.
@@ -6231,6 +6721,7 @@ main{padding:18px 16px 60px}
     var prefix = document.body ? document.body.getAttribute('data-report-prefix') : null;
     if (prefix) { reportPrefix = prefix; }
     buildIndex();
+    initDevicePagers();
     initTabKeyboard();
     initShortcuts();
     apply();
@@ -6299,7 +6790,7 @@ main{padding:18px 16px 60px}
     $panelT2 = @"
   <div class="card">
     <h2><span class="h-dot blue"></span>Applications d&eacute;couvertes sur le parc</h2>
-    <p class="sub">$appsTotal application(s) d&eacute;tect&eacute;e(s), tri&eacute;es par nombre de postes d&eacute;croissant. Le d&eacute;tail nominatif des postes est charg&eacute; pour les <b>$detailedN</b> applications les plus r&eacute;pandues.</p>
+    <p class="sub">$appsTotal application(s) d&eacute;tect&eacute;e(s), tri&eacute;es par nombre de postes d&eacute;croissant. $appsDetailText D&eacute;pliez une application&nbsp;: ses postes s'affichent par tranches de 20, avec une recherche et un export CSV de la liste compl&egrave;te.</p>
     <div class="toolbar">
       <input id="appSearch" class="search" type="search" placeholder="&#128269;  Rechercher une application ou un &eacute;diteur..." oninput="filterApps()">
       <button type="button" class="btn" onclick="setAppsOpen(true)">Tout d&eacute;plier</button>
@@ -8239,7 +8730,7 @@ $tabReports.Controls.Add($cardDiscovered)
 $lblTopApps           = New-Object System.Windows.Forms.Label
 $lblTopApps.Location  = New-Object System.Drawing.Point(22, 46)
 $lblTopApps.Size      = New-Object System.Drawing.Size(600, 52)
-$lblTopApps.Text      = "Nombre d'applications à détailler (Top N par nombre de postes) :`nUn nombre élevé augmente la précision mais ralentit fortement la génération."
+$lblTopApps.Text      = "Nombre d'applications à détailler (Top N par nombre de postes, 0 = toutes) :`nLa liste des postes de chaque application détaillée est complète ; un grand nombre allonge la collecte."
 $lblTopApps.Font      = New-Object System.Drawing.Font($Theme.FontFamily, 9)
 $lblTopApps.ForeColor = ConvertTo-UIColor $Theme.TextMain
 $lblTopApps.BackColor = [System.Drawing.Color]::Transparent
