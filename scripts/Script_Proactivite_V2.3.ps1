@@ -31,6 +31,9 @@
 #                 tableau HTML par application : rapport plus léger et plus rapide à ouvrir
 #               - masquage des termes sensibles étendu à ces données
 #               Les ajouts sont repérés par la balise [V2.2].
+# Nouveautés V2.3 : TOUTES les applications découvertes ont leur liste de postes par défaut
+#               (case « Toutes les applications », cochée) ; la limite aux N plus répandues
+#               (50 auparavant, appliquée sans le dire) n'est plus qu'une option. Balise [V2.3].
 # Auteur : ECONOCOM
 # ============================================================
 
@@ -1493,7 +1496,7 @@ function Get-DiscoveredAppsReportFromImport {
     param(
         [string]$AppsPath,
         [string]$DevicesPath,
-        [int]$TopNDetailed = 50,
+        [int]$TopNDetailed = 0,
         [bool]$AnonymizeData = $false,
         [scriptblock]$ProgressCallback
     )
@@ -1844,7 +1847,7 @@ function Get-DiscoveredAppsReport {
     #>
     param(
         [Parameter(Mandatory = $true)][string]$AccessToken,
-        [int]$TopNDetailed = 50,
+        [int]$TopNDetailed = 0,
         [bool]$AnonymizeData = $false,
         [scriptblock]$ProgressCallback,
         # Garde-fou : 200 pages de 999 postes = près de 200 000 postes pour UNE application
@@ -5363,7 +5366,7 @@ function Build-AppAccordionHtml {
             if ($detailed.Contains([string]$app.id)) {
                 [void]$sb.Append("<div class='note note-info'>Aucun poste associ&eacute; &agrave; cette application dans les donn&eacute;es collect&eacute;es.</div>")
             } else {
-                [void]$sb.Append("<div class='note note-info'>D&eacute;tail non charg&eacute;&nbsp;: seules les $TopNDetailed applications les plus r&eacute;pandues sont d&eacute;taill&eacute;es. R&eacute;glez &laquo;&nbsp;Nombre d'applications &agrave; d&eacute;tailler&nbsp;&raquo; sur 0 dans l'outil pour les d&eacute;tailler toutes (ou d&eacute;tail absent du fichier import&eacute;).</div>")
+                [void]$sb.Append("<div class='note note-info'>D&eacute;tail non charg&eacute;&nbsp;: la collecte a &eacute;t&eacute; limit&eacute;e aux $TopNDetailed applications les plus r&eacute;pandues. Cochez &laquo;&nbsp;Toutes les applications&nbsp;&raquo; dans l'outil (onglet Rapports &amp; Versions) pour les d&eacute;tailler toutes (ou d&eacute;tail absent du fichier import&eacute;).</div>")
             }
         }
         [void]$sb.Append("</div></details>")
@@ -7108,7 +7111,7 @@ function Generate-Dashboard {
         Write-Log "Fichiers : appareils='$ImpDevices' / conformite='$ImpCompliance' / appsDecouvertes='$ImpDiscovered' / postesParApp='$ImpAppDevices' / inventaire='$ImpInventory' / scores='$ImpScores' / demarrage='$ImpPerf'" -Level INFO
     }
     Write-Log "Onglets du rapport : Conformite=$IncCompliance / AppsDecouvertes=$IncDiscovered / Inventaire=$IncInventory / Remediation=$IncRemediation" -Level INFO
-    Write-Log "Options : ExcludeVM=$($chkExcludeVM.Checked) / Anonymize=$($chkAnonymize.Checked) / AnonClient=$($chkAnonClient.Checked) / AnonApps=$($chkAnonApps.Checked) / TopNApps=$($numTopApps.Value) / UseWinget=$($chkUseWinget.Checked) / UseGitHubPkgs=$($chkUseGitHubPkgs.Checked) / JetonGitHub=$(if($txtGhToken.Text.Trim()){'oui'}else{'non'}) / OverrideCsv='$($txtOverrideCsv.Text)'" -Level INFO
+    Write-Log "Options : ExcludeVM=$($chkExcludeVM.Checked) / Anonymize=$($chkAnonymize.Checked) / AnonClient=$($chkAnonClient.Checked) / AnonApps=$($chkAnonApps.Checked) / TopNApps=$(if ($chkAllApps.Checked) { 'toutes' } else { $numTopApps.Value }) / UseWinget=$($chkUseWinget.Checked) / UseGitHubPkgs=$($chkUseGitHubPkgs.Checked) / JetonGitHub=$(if($txtGhToken.Text.Trim()){'oui'}else{'non'}) / OverrideCsv='$($txtOverrideCsv.Text)'" -Level INFO
 
     try {
         # ===== CONNEXION GRAPH (uniquement si au moins un jeu de données vient de l'API) =====
@@ -7168,7 +7171,8 @@ function Generate-Dashboard {
         # $ClientName reste le vrai nom pour tout le reste (configuration, fichiers internes).
         $ReportClientName = if ($AnonymizeClient) { $AnonClientLabel } else { $ClientName }
         Save-AnonymizationTerms -ClientName $ClientName -Terms $txtAnonTerms.Text
-        $TopNDetailed   = [int]$numTopApps.Value
+        # [V2.3] 0 = toutes les applications (case cochée par défaut)
+        $TopNDetailed   = if ($chkAllApps.Checked) { 0 } else { [int]$numTopApps.Value }
         $UseWinget      = $chkUseWinget.Checked
         $OverrideCsv    = $txtOverrideCsv.Text.Trim()
         $UseGitHubPkgs  = $chkUseGitHubPkgs.Checked
@@ -8729,23 +8733,44 @@ $tabReports.Controls.Add($cardDiscovered)
 
 $lblTopApps           = New-Object System.Windows.Forms.Label
 $lblTopApps.Location  = New-Object System.Drawing.Point(22, 46)
-$lblTopApps.Size      = New-Object System.Drawing.Size(600, 52)
-$lblTopApps.Text      = "Nombre d'applications à détailler (Top N par nombre de postes, 0 = toutes) :`nLa liste des postes de chaque application détaillée est complète ; un grand nombre allonge la collecte."
+$lblTopApps.Size      = New-Object System.Drawing.Size(490, 52)
+$lblTopApps.Text      = "Applications dont la liste des postes est chargée :`nToutes par défaut ; limitez aux N plus répandues seulement si la collecte est trop longue."
 $lblTopApps.Font      = New-Object System.Drawing.Font($Theme.FontFamily, 9)
 $lblTopApps.ForeColor = ConvertTo-UIColor $Theme.TextMain
 $lblTopApps.BackColor = [System.Drawing.Color]::Transparent
 $cardDiscovered.Controls.Add($lblTopApps)
 
+# [V2.3] « Toutes les applications » coché par défaut : la liste des postes de CHAQUE
+# application est chargée. Le nombre ne sert plus qu'à limiter volontairement la collecte.
+$chkAllApps           = New-Object System.Windows.Forms.CheckBox
+$chkAllApps.Location  = New-Object System.Drawing.Point(530, 53)
+$chkAllApps.Size      = New-Object System.Drawing.Size(190, 24)
+$chkAllApps.Text      = "Toutes les applications"
+$chkAllApps.Checked   = $true
+$chkAllApps.Font      = New-Object System.Drawing.Font($Theme.FontFamily, 9, [System.Drawing.FontStyle]::Bold)
+$chkAllApps.ForeColor = ConvertTo-UIColor $Theme.TextMain
+$cardDiscovered.Controls.Add($chkAllApps)
+
 $numTopApps             = New-Object System.Windows.Forms.NumericUpDown
-$numTopApps.Location    = New-Object System.Drawing.Point(650, 52)
+$numTopApps.Location    = New-Object System.Drawing.Point(730, 52)
 $numTopApps.Size        = New-Object System.Drawing.Size(90, 26)
-$numTopApps.Minimum     = 0
-$numTopApps.Maximum     = 2000
+$numTopApps.Minimum     = 1
+$numTopApps.Maximum     = 5000
 $numTopApps.Value       = 50
 $numTopApps.Increment   = 10
 $numTopApps.Font        = New-Object System.Drawing.Font($Theme.FontFamily, 10)
 $numTopApps.BorderStyle = "FixedSingle"
+$numTopApps.Enabled     = $false
 $cardDiscovered.Controls.Add($numTopApps)
+
+$chkAllApps.Add_CheckedChanged({ $numTopApps.Enabled = -not $chkAllApps.Checked })
+$tipTopApps = New-Object System.Windows.Forms.ToolTip
+$tipTopApps.AutoPopDelay = 20000
+$tipTopApps.InitialDelay = 350
+$tipTopApps.SetToolTip($chkAllApps, ("Charge la liste complète des postes de chaque application découverte." + [Environment]::NewLine +
+    "Coût : une requête par application et une par tranche de 999 postes, envoyées par lots de 20." + [Environment]::NewLine +
+    "Décochez pour ne détailler que les N applications les plus répandues (collecte plus courte)."))
+$tipTopApps.SetToolTip($numTopApps, "Nombre d'applications détaillées quand « Toutes les applications » est décoché (les plus répandues d'abord).")
 
 $cardVersions = New-CardPanel -Title "Inventaire & audit des versions (Onglet 3 du rapport)" -X 24 -Y 156 -W 880 -H 270
 $tabReports.Controls.Add($cardVersions)
